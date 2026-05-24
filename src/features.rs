@@ -24,9 +24,7 @@ impl KmerTable {
         };
 
         // Encode base array → raw index
-        let encode = |bases: &[usize]| -> usize {
-            bases.iter().fold(0, |acc, &b| acc * 4 + b)
-        };
+        let encode = |bases: &[usize]| -> usize { bases.iter().fold(0, |acc, &b| acc * 4 + b) };
 
         // For each raw kmer, compute the raw index of its canonical (min) rotation
         let canonical_raw: Vec<usize> = (0..num_raw)
@@ -61,13 +59,14 @@ impl KmerTable {
         let mut name_map: Vec<String> = vec![String::new(); n];
         for (&cr, &ci) in &seen {
             let bases = decode(cr);
-            name_map[ci] = bases
-                .iter()
-                .map(|&b| BASES[b] as char)
-                .collect();
+            name_map[ci] = bases.iter().map(|&b| BASES[b] as char).collect();
         }
 
-        KmerTable { compact, n, names: name_map }
+        KmerTable {
+            compact,
+            n,
+            names: name_map,
+        }
     }
 }
 

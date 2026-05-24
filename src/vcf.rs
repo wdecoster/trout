@@ -104,13 +104,10 @@ fn read_vcf(path: &Path) -> Result<LocusMap, Box<dyn std::error::Error + Send + 
                 }
             };
 
-            locus_map
-                .entry(key.clone())
-                .or_default()
-                .push(Allele {
-                    sample: sample_name.clone(),
-                    seq,
-                });
+            locus_map.entry(key.clone()).or_default().push(Allele {
+                sample: sample_name.clone(),
+                seq,
+            });
         }
     }
 

@@ -9,11 +9,10 @@ use std::path::Path;
 pub struct LocusPlotData {
     pub title: String,
     pub y_label: String,
-    pub normal: Vec<(f64, f64, String)>,         // (length_bp, kmer_freq, sample)
-    pub outliers: Vec<(f64, f64, String)>,        // outliers for this axis
-    pub other_outliers: Vec<(f64, f64, String)>,  // outliers flagged on a different axis
+    pub normal: Vec<(f64, f64, String)>, // (length_bp, kmer_freq, sample)
+    pub outliers: Vec<(f64, f64, String)>, // outliers for this axis
+    pub other_outliers: Vec<(f64, f64, String)>, // outliers flagged on a different axis
 }
-
 
 pub fn render_scatter_plots(data: &[LocusPlotData], path: &Path) {
     if data.is_empty() {
@@ -33,10 +32,8 @@ pub fn render_scatter_plots(data: &[LocusPlotData], path: &Path) {
             let mut panel: Vec<Plot> = Vec::new();
 
             if !locus.normal.is_empty() {
-                let xy: Vec<(f64, f64)> =
-                    locus.normal.iter().map(|(l, f, _)| (*l, *f)).collect();
-                let labels: Vec<String> =
-                    locus.normal.iter().map(|(_, _, s)| s.clone()).collect();
+                let xy: Vec<(f64, f64)> = locus.normal.iter().map(|(l, f, _)| (*l, *f)).collect();
+                let labels: Vec<String> = locus.normal.iter().map(|(_, _, s)| s.clone()).collect();
                 panel.push(Plot::Scatter(
                     ScatterPlot::new()
                         .with_data(xy)
@@ -48,10 +45,16 @@ pub fn render_scatter_plots(data: &[LocusPlotData], path: &Path) {
             }
 
             if !locus.other_outliers.is_empty() {
-                let xy: Vec<(f64, f64)> =
-                    locus.other_outliers.iter().map(|(l, f, _)| (*l, *f)).collect();
-                let labels: Vec<String> =
-                    locus.other_outliers.iter().map(|(_, _, s)| s.clone()).collect();
+                let xy: Vec<(f64, f64)> = locus
+                    .other_outliers
+                    .iter()
+                    .map(|(l, f, _)| (*l, *f))
+                    .collect();
+                let labels: Vec<String> = locus
+                    .other_outliers
+                    .iter()
+                    .map(|(_, _, s)| s.clone())
+                    .collect();
                 panel.push(Plot::Scatter(
                     ScatterPlot::new()
                         .with_data(xy)
@@ -63,8 +66,7 @@ pub fn render_scatter_plots(data: &[LocusPlotData], path: &Path) {
             }
 
             if !locus.outliers.is_empty() {
-                let xy: Vec<(f64, f64)> =
-                    locus.outliers.iter().map(|(l, f, _)| (*l, *f)).collect();
+                let xy: Vec<(f64, f64)> = locus.outliers.iter().map(|(l, f, _)| (*l, *f)).collect();
                 let labels: Vec<String> =
                     locus.outliers.iter().map(|(_, _, s)| s.clone()).collect();
                 panel.push(Plot::Scatter(
@@ -87,14 +89,20 @@ pub fn render_scatter_plots(data: &[LocusPlotData], path: &Path) {
             // Direction is based on which side of the data midpoint the point sits on —
             // unlike centroid-based shifting, this is invariant to skewed distributions
             // where a dense cluster pulls the centroid past the outlier point.
-            let all_x: Vec<f64> = locus.normal.iter()
+            let all_x: Vec<f64> = locus
+                .normal
+                .iter()
                 .chain(locus.outliers.iter())
                 .chain(locus.other_outliers.iter())
-                .map(|(x, _, _)| *x).collect();
-            let all_y: Vec<f64> = locus.normal.iter()
+                .map(|(x, _, _)| *x)
+                .collect();
+            let all_y: Vec<f64> = locus
+                .normal
+                .iter()
                 .chain(locus.outliers.iter())
                 .chain(locus.other_outliers.iter())
-                .map(|(_, y, _)| *y).collect();
+                .map(|(_, y, _)| *y)
+                .collect();
             let x_min = all_x.iter().cloned().fold(f64::INFINITY, f64::min);
             let x_max = all_x.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
             let y_min = all_y.iter().cloned().fold(f64::INFINITY, f64::min);
@@ -106,7 +114,9 @@ pub fn render_scatter_plots(data: &[LocusPlotData], path: &Path) {
             let off_frac = 0.15;
 
             // Compute initial label positions, then stagger any that overlap in y.
-            let mut labels: Vec<(f64, f64, f64, f64, String)> = locus.outliers.iter()
+            let mut labels: Vec<(f64, f64, f64, f64, String)> = locus
+                .outliers
+                .iter()
                 .map(|(px, py, sample)| {
                     let lx = if *px <= x_mid {
                         px + off_frac * (x_range + 1e-10)

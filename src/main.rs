@@ -181,8 +181,10 @@ fn main() {
     let multi_k = all_ks.len() > 1;
 
     // Precompute KmerTable and feature names for every k that will be needed.
-    let kmer_tables: HashMap<usize, features::KmerTable> =
-        all_ks.iter().map(|&k| (k, features::KmerTable::new(k))).collect();
+    let kmer_tables: HashMap<usize, features::KmerTable> = all_ks
+        .iter()
+        .map(|&k| (k, features::KmerTable::new(k)))
+        .collect();
     let kmer_names: HashMap<usize, Vec<String>> = kmer_tables
         .iter()
         .map(|(&k, t)| (k, features::feature_names(t)))
@@ -232,8 +234,7 @@ fn main() {
     let min_axis_dev = args.min_axis_dev;
     let min_locus_samples = args.min_locus_samples;
     let min_length = args.min_length;
-    let samples_of_interest: Option<HashSet<String>> =
-        args.samples.as_deref().map(parse_samples);
+    let samples_of_interest: Option<HashSet<String>> = args.samples.as_deref().map(parse_samples);
     let has_repeat = repeat_map.is_some();
 
     if has_repeat {
@@ -251,8 +252,7 @@ fn main() {
     let results: Vec<LocusResult> = loci
         .into_par_iter()
         .filter_map(|((chrom, pos, end), alleles)| {
-            let unique_samples: HashSet<&str> =
-                alleles.iter().map(|a| a.sample.as_str()).collect();
+            let unique_samples: HashSet<&str> = alleles.iter().map(|a| a.sample.as_str()).collect();
             if unique_samples.len() < min_locus_samples {
                 return None;
             }
@@ -263,8 +263,9 @@ fn main() {
             }
 
             // Per-locus k, table, and names from --repeat; fall back to global defaults.
-            let repeat_entry =
-                repeat_map.as_ref().and_then(|rm| rm.get(&(chrom.clone(), pos, end)));
+            let repeat_entry = repeat_map
+                .as_ref()
+                .and_then(|rm| rm.get(&(chrom.clone(), pos, end)));
             let locus_k = repeat_entry.map(|e| e.k).unwrap_or(kmer);
             let locus_table = kmer_tables.get(&locus_k).unwrap();
             let locus_names = kmer_names.get(&locus_k).unwrap();
@@ -295,8 +296,14 @@ fn main() {
             }
 
             let cluster_mean = cluster_mean(&points, &is_noise);
-            let locus_top_axes =
-                top_axes(&points, &is_noise, &cluster_mean, locus_names, 2, length_weight);
+            let locus_top_axes = top_axes(
+                &points,
+                &is_noise,
+                &cluster_mean,
+                locus_names,
+                2,
+                length_weight,
+            );
 
             if let Some(thresh) = min_axis_dev {
                 if locus_top_axes
@@ -308,8 +315,7 @@ fn main() {
                 }
             }
 
-            let top_axis_names: Vec<String> =
-                locus_top_axes.into_iter().map(|(n, _)| n).collect();
+            let top_axis_names: Vec<String> = locus_top_axes.into_iter().map(|(n, _)| n).collect();
 
             // Collect outlier samples, restricted to --samples list when provided.
             let mut seen: HashSet<&str> = HashSet::new();
@@ -340,7 +346,8 @@ fn main() {
                 Vec::new()
             };
 
-            let title_prefix = label.as_deref()
+            let title_prefix = label
+                .as_deref()
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| format!("{}:{}-{}", chrom, pos, end));
 
@@ -502,9 +509,7 @@ fn build_plot_data(
             let group_points: Vec<&Vec<f64>> = pts
                 .iter()
                 .zip(outlier_top_axes.iter())
-                .filter(|((_, _, _, is_out), ax)| {
-                    *is_out && ax.as_deref() == Some("length")
-                })
+                .filter(|((_, _, _, is_out), ax)| *is_out && ax.as_deref() == Some("length"))
                 .map(|((_, _, pt, _), _)| *pt)
                 .collect();
             // Exclude kmer axes that already have a dedicated plot — avoids
@@ -525,9 +530,7 @@ fn build_plot_data(
         let mut outlier_pts: Vec<(f64, f64, String)> = Vec::new();
         let mut other_outlier_pts: Vec<(f64, f64, String)> = Vec::new();
 
-        for ((sample, raw_len, point, is_out), top_ax) in
-            pts.iter().zip(outlier_top_axes.iter())
-        {
+        for ((sample, raw_len, point, is_out), top_ax) in pts.iter().zip(outlier_top_axes.iter()) {
             let y_val = point[y_feat_idx];
             if *is_out && top_ax.as_deref() == Some(axis_name.as_str()) {
                 // Listed outlier for this axis → red
@@ -702,7 +705,11 @@ fn parse_repeat_file(path: &Path) -> RepeatMap {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Warning: could not read repeat file {}: {}", path.display(), e);
+            eprintln!(
+                "Warning: could not read repeat file {}: {}",
+                path.display(),
+                e
+            );
             return map;
         }
     };
