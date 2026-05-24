@@ -305,14 +305,13 @@ fn main() {
                 length_weight,
             );
 
-            if let Some(thresh) = min_axis_dev {
-                if locus_top_axes
+            if let Some(thresh) = min_axis_dev
+                && locus_top_axes
                     .first()
                     .map(|(_, dev)| *dev < thresh)
                     .unwrap_or(true)
-                {
-                    is_noise.iter_mut().for_each(|n| *n = false);
-                }
+            {
+                is_noise.iter_mut().for_each(|n| *n = false);
             }
 
             let top_axis_names: Vec<String> = locus_top_axes.into_iter().map(|(n, _)| n).collect();
@@ -454,6 +453,7 @@ fn main() {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_plot_data(
     alleles: &[vcf::Allele],
     points: &[Vec<f64>],

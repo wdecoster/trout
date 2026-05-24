@@ -24,7 +24,7 @@ pub fn render_scatter_plots(data: &[LocusPlotData], path: &Path) {
     // +1 for the shared legend panel
     let n_total = n_data + 1;
     let cols = n_total.min(4);
-    let rows = (n_total + cols - 1) / cols;
+    let rows = n_total.div_ceil(cols);
 
     let (mut all_plots, mut all_layouts): (Vec<Vec<Plot>>, Vec<Layout>) = data
         .iter()

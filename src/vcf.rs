@@ -116,17 +116,17 @@ fn read_vcf(path: &Path) -> Result<LocusMap, Box<dyn std::error::Error + Send + 
 
 fn parse_end(info: &str, pos: u32, ref_len: u32) -> u32 {
     for field in info.split(';') {
-        if let Some(val) = field.strip_prefix("END=") {
-            if let Ok(end) = val.parse() {
-                return end;
-            }
+        if let Some(val) = field.strip_prefix("END=")
+            && let Ok(end) = val.parse()
+        {
+            return end;
         }
     }
     pos + ref_len
 }
 
 fn parse_gt(gt: &str) -> Vec<usize> {
-    gt.split(|c| c == '|' || c == '/')
+    gt.split(['|', '/'])
         .filter_map(|a| a.trim().parse().ok())
         .collect()
 }
