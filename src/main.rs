@@ -244,7 +244,13 @@ fn main() {
     }
 
     let mut loci: Vec<_> = locus_map.into_iter().collect();
-    loci.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    loci.sort_unstable_by(|a, b| {
+        let (ca, pa, ea) = &a.0;
+        let (cb, pb, eb) = &b.0;
+        cmp_chrom(ca, cb)
+            .then_with(|| pa.cmp(pb))
+            .then_with(|| ea.cmp(eb))
+    });
 
     // Each locus is fully independent: feature computation, DBSCAN, and plot data
     // generation are all embarrassingly parallel. Results are collected in sorted
@@ -744,4 +750,15 @@ fn parse_repeat_file(path: &Path) -> RepeatMap {
         );
     }
     map
+}
+
+fn cmp_chrom(a: &str, b: &str) -> std::cmp::Ordering {
+    let a = a.strip_prefix("chr").unwrap_or(a);
+    let b = b.strip_prefix("chr").unwrap_or(b);
+    match (a.parse::<u64>(), b.parse::<u64>()) {
+        (Ok(na), Ok(nb)) => na.cmp(&nb),
+        (Ok(_), Err(_)) => std::cmp::Ordering::Less,
+        (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
+        (Err(_), Err(_)) => a.cmp(b),
+    }
 }
