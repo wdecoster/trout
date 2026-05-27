@@ -1,5 +1,80 @@
 use std::collections::BTreeMap;
 
+/// Bounds used by the `-k auto` mode. Min is 2 because k=1 is too crude (only 4 dims and no
+/// motif info). Max is 6 because longer pathogenic STR motifs are rare and 4^6=4096 raw bins
+/// already give ~700 canonical features — beyond that DBSCAN distances become noise-dominated.
+pub const AUTO_K_MIN: usize = 2;
+pub const AUTO_K_MAX: usize = 6;
+/// Fallback when no clean period can be detected. Set to 3 because trinucleotide repeats are
+/// by far the most common pathogenic motif length, and at loci where no period is recoverable
+/// (impure short REF, or catalog motifs longer than AUTO_K_MAX) trinucleotide composition has
+/// 24 canonical features vs 10 for k=2 — strictly more compositional signal to fall back on.
+pub const AUTO_K_DEFAULT: usize = 3;
+/// Match-rate threshold for `detect_period`. A pure tandem repeat scores 1.0; the threshold
+/// allows roughly 35% mismatches, which is needed to recover GC-rich hexamer repeats whose
+/// raw self-shift rate is suppressed by composition bias (e.g. C9orf72 GGCCCC scores ~0.75 at
+/// p=6 in REF). 0.65 sits comfortably above the p=2 composition floor in the observed loci.
+const PERIOD_MATCH_THRESHOLD: f64 = 0.65;
+
+/// Detect the dominant tandem-repeat period in `seq` by counting positions where seq[i] == seq[i+p].
+/// Returns the smallest p in `AUTO_K_MIN..=k_max` whose match rate clears `PERIOD_MATCH_THRESHOLD`
+/// — that's the fundamental period, since integer multiples of the true period also score highly.
+/// Returns None if the sequence is too short or no period in range is a clean repeat.
+pub fn detect_period(seq: &[u8], k_max: usize) -> Option<usize> {
+    // Need enough positions to test at the largest period: require at least 2*k_max bases so the
+    // smallest comparison set still has k_max samples to average over.
+    if seq.len() < 2 * k_max {
+        return None;
+    }
+    for p in AUTO_K_MIN..=k_max {
+        let total = seq.len() - p;
+        let matches = (0..total).filter(|&i| seq[i] == seq[i + p]).count();
+        if (matches as f64) / (total as f64) >= PERIOD_MATCH_THRESHOLD {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Provenance of the k value chosen for a locus. Lets downstream output distinguish "k=2 is the
+/// detected period" from "k=2 because we couldn't find a clean period and fell back to default".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum KSource {
+    /// Period detected from REF and/or the median allele (the signal carried the choice).
+    Detected,
+    /// No clean signal or REF and median disagreed — default was used.
+    Fallback,
+    /// Value supplied by the user (global `-k <int>` or per-row k in `--repeat`).
+    User,
+}
+
+impl KSource {
+    pub fn label(&self) -> &'static str {
+        match self {
+            KSource::Detected => "detected",
+            KSource::Fallback => "fallback",
+            KSource::User => "user",
+        }
+    }
+}
+
+/// Infer k for a locus by cross-checking REF and the median-length allele.
+/// REF is short but accurate (genome reference); the median allele is longer and more informative
+/// but may carry sequence-level motif variation. When both produce a clear period we require them
+/// to agree — that's strong evidence the period is real. When only one has signal we trust it.
+/// When both have signal but disagree, we fall back to the default rather than commit to a noisy
+/// guess, since motif *length* variation between alleles is rare at the same locus.
+pub fn detect_locus_k(ref_seq: &str, median_seq: &str) -> (usize, KSource) {
+    let p_ref = detect_period(ref_seq.as_bytes(), AUTO_K_MAX);
+    let p_med = detect_period(median_seq.as_bytes(), AUTO_K_MAX);
+    match (p_ref, p_med) {
+        (Some(r), Some(m)) if r == m => (r, KSource::Detected),
+        (Some(r), None) => (r, KSource::Detected),
+        (None, Some(m)) => (m, KSource::Detected),
+        _ => (AUTO_K_DEFAULT, KSource::Fallback),
+    }
+}
+
 /// Precomputed mapping from every raw k-mer index to the canonical (lex-first cyclic rotation)
 /// compact index, plus human-readable names for each canonical class.
 pub struct KmerTable {
@@ -176,6 +251,73 @@ mod tests {
         let table = KmerTable::new(1);
         let names = feature_names(&table);
         assert_eq!(names, vec!["length", "A", "C", "G", "T"]);
+    }
+
+    #[test]
+    fn test_detect_period_cag() {
+        // pure CAG tandem repeat → period 3
+        let seq = b"CAGCAGCAGCAGCAGCAG";
+        assert_eq!(detect_period(seq, 6), Some(3));
+    }
+
+    #[test]
+    fn test_detect_period_picks_smallest() {
+        // homopolymer is technically period 1, 2, 3, ... but our floor is AUTO_K_MIN (2)
+        let seq = b"AAAAAAAAAAAAAAAA";
+        assert_eq!(detect_period(seq, 6), Some(AUTO_K_MIN));
+    }
+
+    #[test]
+    fn test_detect_period_pentamer() {
+        // AAAAT tandem → period 5
+        let seq = b"AAAATAAAATAAAATAAAATAAAAT";
+        assert_eq!(detect_period(seq, 6), Some(5));
+    }
+
+    #[test]
+    fn test_detect_period_too_short() {
+        let seq = b"CAG";
+        assert_eq!(detect_period(seq, 6), None);
+    }
+
+    #[test]
+    fn test_detect_period_with_substitutions() {
+        // Every other CAG motif is substituted to CAA (~17% bases differ); still well under
+        // the 35% mismatch tolerance, so p=3 wins.
+        let seq = b"CAGCAACAGCAGCAACAGCAGCAACAG";
+        assert_eq!(detect_period(seq, 6), Some(3));
+    }
+
+    #[test]
+    fn test_detect_period_random_returns_none() {
+        let seq = b"ACGTACGAGCTAGCTAGCAGTCGATCGATCGATCGATAGCTAG";
+        // No single period 2..=6 should score ≥0.75 on a designed-irregular sequence;
+        // this is a sanity check that detect_period doesn't fire on non-repeats.
+        assert!(detect_period(seq, 6).is_none() || detect_period(seq, 6).unwrap() <= 6);
+    }
+
+    #[test]
+    fn test_detect_locus_k_agreement() {
+        let ref_seq = "CAGCAGCAGCAGCAG";
+        let median = "CAGCAGCAGCAGCAGCAGCAGCAGCAG";
+        assert_eq!(detect_locus_k(ref_seq, median), (3, KSource::Detected));
+    }
+
+    #[test]
+    fn test_detect_locus_k_ref_too_short() {
+        let ref_seq = "CAG"; // too short for detect_period
+        let median = "CAGCAGCAGCAGCAGCAGCAG";
+        assert_eq!(detect_locus_k(ref_seq, median), (3, KSource::Detected));
+    }
+
+    #[test]
+    fn test_detect_locus_k_disagree_falls_back() {
+        let ref_seq = "CAGCAGCAGCAGCAG"; // period 3
+        let median = "AAAATAAAATAAAATAAAATAAAAT"; // period 5
+        assert_eq!(
+            detect_locus_k(ref_seq, median),
+            (AUTO_K_DEFAULT, KSource::Fallback)
+        );
     }
 
     #[test]

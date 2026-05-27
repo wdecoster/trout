@@ -1,6 +1,6 @@
 use clap::Parser;
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
@@ -27,9 +27,10 @@ struct Args {
         long = "kmer",
         default_value = "2",
         hide_default_value = true,
-        help = "K-mer length for sequence composition features [default: 2]"
+        help = "K-mer length for sequence composition features, or 'auto' to detect per locus \
+                from sequence periodicity (REF and median-length allele must agree) [default: 2]"
     )]
-    kmer: usize,
+    kmer: String,
 
     #[arg(
         long = "eps",
@@ -137,6 +138,12 @@ struct RepeatEntry {
 
 type RepeatMap = HashMap<(String, u32, u32), RepeatEntry>;
 
+/// How the user specified `-k`. `Auto` means detect per locus from sequence periodicity.
+enum KSpec {
+    Fixed(usize),
+    Auto,
+}
+
 struct LocusResult {
     chrom: String,
     pos: u32,
@@ -145,8 +152,13 @@ struct LocusResult {
     outlier_samples: Vec<String>,
     top_axis_names: Vec<String>,
     n_outliers: usize,
-    feat_rows: Vec<(String, usize, Vec<f64>, bool)>,
+    /// Each row: (sample, raw_length, feature_vector, is_outlier, k_used, k_source)
+    feat_rows: Vec<(String, usize, Vec<f64>, bool, usize, features::KSource)>,
     plot_data: Vec<plot::LocusPlotData>,
+    /// k actually used for this locus (for the --kmer auto summary).
+    locus_k: usize,
+    /// Whether k was detected, fell back to default, or specified by the user.
+    k_source: features::KSource,
 }
 
 fn main() {
@@ -165,12 +177,26 @@ fn main() {
         .min_samples
         .unwrap_or_else(|| (n_vcfs as f64).log2() as usize + 1);
 
+    let k_spec = parse_k_spec(&args.kmer);
+
     let repeat_map: Option<RepeatMap> = args.repeat.as_deref().map(parse_repeat_file);
 
-    // Collect all unique k values: global default plus any per-locus k from the repeat file.
+    // Collect all unique k values that may be needed.
+    //  - Fixed: just that k (plus any per-locus k from --repeat)
+    //  - Auto: precompute all of AUTO_K_MIN..=AUTO_K_MAX since we don't know upfront which a
+    //    locus will pick; the cost is at most ~5 small tables.
     let all_ks: HashSet<usize> = {
         let mut ks = HashSet::new();
-        ks.insert(args.kmer);
+        match k_spec {
+            KSpec::Fixed(k) => {
+                ks.insert(k);
+            }
+            KSpec::Auto => {
+                for k in features::AUTO_K_MIN..=features::AUTO_K_MAX {
+                    ks.insert(k);
+                }
+            }
+        }
         if let Some(ref rm) = repeat_map {
             for e in rm.values() {
                 ks.insert(e.k);
@@ -178,7 +204,9 @@ fn main() {
         }
         ks
     };
-    let multi_k = all_ks.len() > 1;
+    // multi_k drives the features-out column layout (key=value vs one column per k-mer).
+    // Auto always implies multi_k since different loci can land on different k.
+    let multi_k = matches!(k_spec, KSpec::Auto) || all_ks.len() > 1;
 
     // Precompute KmerTable and feature names for every k that will be needed.
     let kmer_tables: HashMap<usize, features::KmerTable> = all_ks
@@ -190,11 +218,18 @@ fn main() {
         .map(|(&k, t)| (k, features::feature_names(t)))
         .collect();
     // Names for the global k — used for the features-out header in single-k mode.
-    let global_names = kmer_names.get(&args.kmer).unwrap();
+    let global_names_owned = match k_spec {
+        KSpec::Fixed(k) => kmer_names.get(&k).cloned(),
+        KSpec::Auto => None,
+    };
 
+    let k_display = match k_spec {
+        KSpec::Fixed(k) => k.to_string(),
+        KSpec::Auto => "auto".to_string(),
+    };
     eprintln!(
         "Loading {} VCFs (k={}, eps={}, min_samples={}, length_weight={})",
-        n_vcfs, args.kmer, args.eps, min_samples, args.length_weight
+        n_vcfs, k_display, args.eps, min_samples, args.length_weight
     );
 
     let locus_map = vcf::read_vcfs(&args.vcfs);
@@ -202,12 +237,6 @@ fn main() {
 
     // Optional feature matrix writer — opened before the parallel section.
     let mut feat_writer: Option<BufWriter<Box<dyn Write>>> = args.features_out.as_ref().map(|p| {
-        if multi_k {
-            eprintln!(
-                "Note: --features-out with multiple k values (from --repeat): \
-                 k-mer frequency columns will be omitted (length only)."
-            );
-        }
         let f: Box<dyn Write> =
             Box::new(std::fs::File::create(p).expect("Cannot create features-out file"));
         let mut w = BufWriter::new(f);
@@ -216,8 +245,13 @@ fn main() {
         } else {
             write!(w, "chrom\tstart\tend\tsample\tis_outlier\tlength").unwrap();
         }
-        if !multi_k {
-            for name in global_names.iter().skip(1) {
+        if multi_k {
+            // Per-locus k can differ, so use a single key=value column instead of one column
+            // per canonical k-mer (which would require a union of columns and waste space).
+            // k_source distinguishes detected periods from default fallbacks vs user overrides.
+            write!(w, "\tk\tk_source\tkmer_freqs").unwrap();
+        } else if let Some(ref names) = global_names_owned {
+            for name in names.iter().skip(1) {
                 write!(w, "\t{}", name).unwrap();
             }
         }
@@ -228,7 +262,6 @@ fn main() {
     let collect_plots = args.plot.is_some();
 
     // Copy scalars so the parallel closure doesn't need to borrow Args.
-    let kmer = args.kmer;
     let eps = args.eps;
     let length_weight = args.length_weight;
     let min_axis_dev = args.min_axis_dev;
@@ -257,7 +290,9 @@ fn main() {
     // order (rayon preserves input order for into_par_iter + collect).
     let results: Vec<LocusResult> = loci
         .into_par_iter()
-        .filter_map(|((chrom, pos, end), alleles)| {
+        .filter_map(|((chrom, pos, end), locus_data)| {
+            let vcf::LocusData { ref_seq, alleles } = locus_data;
+
             let unique_samples: HashSet<&str> = alleles.iter().map(|a| a.sample.as_str()).collect();
             if unique_samples.len() < min_locus_samples {
                 return None;
@@ -268,11 +303,24 @@ fn main() {
                 return None;
             }
 
-            // Per-locus k, table, and names from --repeat; fall back to global defaults.
+            // Per-locus k precedence:
+            //   1. --repeat row's explicit k (most authoritative — user-curated)
+            //   2. auto detection from REF + median-length allele (-k auto)
+            //   3. global -k value
             let repeat_entry = repeat_map
                 .as_ref()
                 .and_then(|rm| rm.get(&(chrom.clone(), pos, end)));
-            let locus_k = repeat_entry.map(|e| e.k).unwrap_or(kmer);
+            let (locus_k, k_source) = if let Some(e) = repeat_entry {
+                (e.k, features::KSource::User)
+            } else {
+                match k_spec {
+                    KSpec::Fixed(k) => (k, features::KSource::User),
+                    KSpec::Auto => {
+                        let median = median_length_allele(&alleles);
+                        features::detect_locus_k(&ref_seq, median)
+                    }
+                }
+            };
             let locus_table = kmer_tables.get(&locus_k).unwrap();
             let locus_names = kmer_names.get(&locus_k).unwrap();
             let label = repeat_entry.map(|e| e.name.clone());
@@ -339,13 +387,23 @@ fn main() {
             let n_outliers = outlier_samples.len();
 
             let feat_rows = if need_feat_rows {
-                let mut rows: Vec<(String, usize, Vec<f64>, bool)> = alleles
-                    .iter()
-                    .zip(points.iter())
-                    .zip(is_noise.iter())
-                    .map(|((a, pt), &noise)| (a.sample.clone(), a.seq.len(), pt.clone(), noise))
-                    .collect();
-                rows.sort_by(|(a, _, _, _), (b, _, _, _)| a.cmp(b));
+                let mut rows: Vec<(String, usize, Vec<f64>, bool, usize, features::KSource)> =
+                    alleles
+                        .iter()
+                        .zip(points.iter())
+                        .zip(is_noise.iter())
+                        .map(|((a, pt), &noise)| {
+                            (
+                                a.sample.clone(),
+                                a.seq.len(),
+                                pt.clone(),
+                                noise,
+                                locus_k,
+                                k_source,
+                            )
+                        })
+                        .collect();
+                rows.sort_by(|(a, _, _, _, _, _), (b, _, _, _, _, _)| a.cmp(b));
                 rows
             } else {
                 Vec::new()
@@ -382,6 +440,8 @@ fn main() {
                 n_outliers,
                 feat_rows,
                 plot_data,
+                locus_k,
+                k_source,
             })
         })
         .collect();
@@ -389,8 +449,14 @@ fn main() {
     // Sequential output: order is preserved from the sorted loci input.
     let mut total_outliers = 0usize;
     let mut plot_loci: Vec<plot::LocusPlotData> = Vec::new();
+    // (k, source) -> count, so the auto-k summary can show e.g. k=2 detected separately from
+    // k=2 fallback. In non-auto mode this is unused.
+    let mut k_histogram: BTreeMap<(usize, features::KSource), usize> = BTreeMap::new();
 
     for result in results {
+        *k_histogram
+            .entry((result.locus_k, result.k_source))
+            .or_insert(0) += 1;
         if !result.outlier_samples.is_empty() {
             if has_repeat {
                 let name = result.label.as_deref().unwrap_or(".");
@@ -418,7 +484,7 @@ fn main() {
 
         if let Some(ref mut w) = feat_writer {
             let name_col = result.label.as_deref().unwrap_or(".");
-            for (sample, raw_len, point, noise) in &result.feat_rows {
+            for (sample, raw_len, point, noise, row_k, row_src) in &result.feat_rows {
                 if has_repeat {
                     write!(
                         w,
@@ -440,7 +506,19 @@ fn main() {
                     )
                     .unwrap();
                 }
-                if !multi_k {
+                if multi_k {
+                    // Key=value column: the k used at this locus plus the canonical k-mer
+                    // frequencies. point[0] is the (weighted) length feature; skip it.
+                    let row_names = kmer_names.get(row_k).unwrap();
+                    let kv = point
+                        .iter()
+                        .zip(row_names.iter())
+                        .skip(1)
+                        .map(|(v, n)| format!("{}={:.3}", n, v))
+                        .collect::<Vec<_>>()
+                        .join(";");
+                    write!(w, "\t{}\t{}\t{}", row_k, row_src.label(), kv).unwrap();
+                } else {
                     for v in point.iter().skip(1) {
                         write!(w, "\t{:.6}", v).unwrap();
                     }
@@ -450,6 +528,14 @@ fn main() {
         }
 
         plot_loci.extend(result.plot_data);
+    }
+
+    if matches!(k_spec, KSpec::Auto) {
+        let parts: Vec<String> = k_histogram
+            .iter()
+            .map(|((k, src), n)| format!("k={} ({}): {}", k, src.label(), n))
+            .collect();
+        eprintln!("Auto-k per locus: {}", parts.join(", "));
     }
 
     eprintln!("Done: {} outlier calls", total_outliers);
@@ -750,6 +836,32 @@ fn parse_repeat_file(path: &Path) -> RepeatMap {
         );
     }
     map
+}
+
+fn parse_k_spec(s: &str) -> KSpec {
+    if s.eq_ignore_ascii_case("auto") {
+        return KSpec::Auto;
+    }
+    match s.parse::<usize>() {
+        Ok(k) if k > 0 => KSpec::Fixed(k),
+        _ => {
+            eprintln!(
+                "Error: --kmer must be a positive integer or 'auto', got {:?}",
+                s
+            );
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Returns the sequence of the allele whose length is the median across the pooled cohort.
+/// Used by `-k auto` to cross-check the period inferred from REF (short but accurate) against a
+/// typical-length allele (longer, more positions to test, but may carry sequence variation).
+fn median_length_allele(alleles: &[vcf::Allele]) -> &str {
+    debug_assert!(!alleles.is_empty());
+    let mut by_len: Vec<&vcf::Allele> = alleles.iter().collect();
+    by_len.sort_by_key(|a| a.seq.len());
+    &by_len[by_len.len() / 2].seq
 }
 
 fn cmp_chrom(a: &str, b: &str) -> std::cmp::Ordering {

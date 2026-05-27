@@ -1,5 +1,6 @@
 use rayon::prelude::*;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
@@ -8,8 +9,16 @@ pub struct Allele {
     pub seq: String,
 }
 
-/// (chrom, pos, end) -> all alleles across all samples at that locus
-pub type LocusMap = HashMap<(String, u32, u32), Vec<Allele>>;
+/// All alleles seen at a locus plus the REF sequence from the VCF.
+/// REF is the same across all input VCFs at the same coordinates (genome reference),
+/// so the first writer wins on merge.
+pub struct LocusData {
+    pub ref_seq: String,
+    pub alleles: Vec<Allele>,
+}
+
+/// (chrom, pos, end) -> locus data
+pub type LocusMap = HashMap<(String, u32, u32), LocusData>;
 
 pub fn read_vcfs(paths: &[PathBuf]) -> LocusMap {
     paths
@@ -22,8 +31,13 @@ pub fn read_vcfs(paths: &[PathBuf]) -> LocusMap {
             }
         })
         .reduce(LocusMap::new, |mut acc, local| {
-            for (key, alleles) in local {
-                acc.entry(key).or_default().extend(alleles);
+            for (key, data) in local {
+                match acc.entry(key) {
+                    Entry::Occupied(mut e) => e.get_mut().alleles.extend(data.alleles),
+                    Entry::Vacant(e) => {
+                        e.insert(data);
+                    }
+                }
             }
             acc
         })
@@ -94,6 +108,11 @@ fn read_vcf(path: &Path) -> Result<LocusMap, Box<dyn std::error::Error + Send + 
         let allele_indices = parse_gt(gt_field);
         let key = (chrom, pos, end);
 
+        let entry = locus_map.entry(key).or_insert_with(|| LocusData {
+            ref_seq: ref_seq.to_string(),
+            alleles: Vec::new(),
+        });
+
         for idx in allele_indices {
             let seq = if idx == 0 {
                 ref_seq.to_string()
@@ -104,7 +123,7 @@ fn read_vcf(path: &Path) -> Result<LocusMap, Box<dyn std::error::Error + Send + 
                 }
             };
 
-            locus_map.entry(key.clone()).or_default().push(Allele {
+            entry.alleles.push(Allele {
                 sample: sample_name.clone(),
                 seq,
             });

@@ -38,6 +38,8 @@ Only loci with at least one outlier are printed.
 
 K-mer length for the sequence composition features. For k=2 there are 16 possible dimers (AA, AC, …, TT); for k=3 there are 64 trimers. Larger k captures more detailed composition information but increases the dimensionality of the DBSCAN feature space, which may require tuning `--eps`. k=2 is a good default for most repeat types.
 
+Pass `-k auto` to let trout pick k per locus from the data. For each locus it runs a self-shift periodicity check on the REF allele and on the median-length allele in the cohort and accepts the period (in 2..=6) when they agree. REF is short but accurate; the median-length allele is longer but may carry motif-sequence variation — requiring agreement guards against picking a spurious period from either alone. When one signal is missing (REF too short, or median is too irregular) the available one is used; when both detect periods but disagree, or when neither has a clean signal (typically loci whose motif is longer than 6 bp), k falls back to 3 (the most common pathogenic motif length, with 24 canonical features vs only 10 at k=2). A summary histogram of the detected k values is printed to stderr at the end of the run. An explicit `k` column in `--repeat` always overrides auto detection for that locus.
+
 ### `--eps` (default: 0.2)
 
 The DBSCAN neighbourhood radius. A point is considered a cluster member if at least `--min-samples` other points lie within this distance (Euclidean, in the normalised [0,1] feature space). **This is the primary sensitivity control:**
@@ -61,7 +63,9 @@ Loci represented in fewer than this many samples are skipped. Increase this if y
 
 ### `--features-out FILE`
 
-Writes a TSV with the full feature matrix: one row per allele per sample per locus, with columns `chrom`, `start`, `end`, `sample`, `is_outlier`, `length` (raw bp), and one column per k-mer. Use this if you want to make custom scatter plots or inspect individual feature values.
+Writes a TSV with the full feature matrix: one row per allele per sample per locus, with columns `chrom`, `start`, `end`, `sample`, `is_outlier`, `length` (raw bp), and one column per k-mer.
+
+When k varies across loci (i.e. `-k auto`, or `--repeat` rows specifying different k values), the per-k-mer columns are replaced by three columns: `k` (the k value used at that locus), `k_source` (`detected` when picked by periodicity, `fallback` when no clean signal was found and the default was used, or `user` when supplied via `-k <int>` or `--repeat`), and `kmer_freqs` (a `;`-separated list of `KMER=FREQ` pairs in canonical-rotation order). Use this if you want to make custom scatter plots or inspect individual feature values.
 
 ### `--plot FILE`
 
@@ -97,7 +101,7 @@ A tab-separated file with five columns: `chrom`, `start`, `end`, `name`, `k`. Ea
 - **name** — replaces the coordinate-based label (`chrom:start-end`) in all output columns and scatter-plot titles.
 - **k** — uses this k-mer length instead of the global `--kmer` for this locus.
 
-Lines beginning with `#` and lines with fewer than five fields are ignored. Loci not present in the file use the global `--kmer` and keep their coordinate label. When multiple k values are in use and `--features-out` is also requested, k-mer frequency columns are omitted from the feature matrix (only the length column is written).
+Lines beginning with `#` and lines with fewer than five fields are ignored. Loci not present in the file use the global `--kmer` (or auto-detection, when `-k auto`) and keep their coordinate label. When multiple k values are in use and `--features-out` is also requested, per-k-mer columns are replaced by `k` and `kmer_freqs` columns (see `--features-out`).
 
 ### `--threads N`
 
