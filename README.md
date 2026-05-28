@@ -17,7 +17,7 @@ trout [OPTIONS] cohort/*.vcf.gz > outliers.tsv
 
 ## Output
 
-The main output is tab-separated to stdout:
+The main output is tab-separated to stdout, with **one row per outlier allele**:
 
 | Column | Description |
 |--------|-------------|
@@ -25,12 +25,12 @@ The main output is tab-separated to stdout:
 | `start` | Locus start (VCF POS, 1-based) |
 | `end` | Locus end (from VCF INFO END) |
 | `name` | Repeat name from `--repeat` file (only present when `--repeat` is used; `.` if locus has no entry) |
-| `samples` | Comma-separated list of outlier samples at this locus |
-| `axes` | Top two feature axes driving the outlier call (e.g. `length,AG`) |
+| `sample` | Sample carrying this outlier allele |
+| `allele_length` | Length of the outlier allele in bp |
+| `top_axis` | Feature axis with the largest deviation from the cluster mean for *this* allele (e.g. `length` for an expansion, or a k-mer name like `CGG` for a composition outlier) |
+| `deviation` | Magnitude of that deviation in the normalized [0,1] feature space (length deviation is rescaled by `--length-weight` for fair comparison with k-mer deviations) |
 
-The `axes` column tells you which dimensions separated the outliers from the cluster. Use it to choose the y-axis when plotting. `length` means the signal is primarily an expansion; a kmer name (e.g. `GG`) means the signal is primarily a composition change.
-
-Only loci with at least one outlier are printed.
+Rows are grouped by locus and within a locus sorted by `deviation` descending, so the most extreme calls appear first. A sample with both alleles flagged produces two rows — itself a useful biallelic signal. Only loci with at least one outlier are printed.
 
 ## Options
 
@@ -89,6 +89,14 @@ This threshold is applied at two levels:
 ### `--min-length N`
 
 Only report outliers where the flagged allele is at least N bp long. Useful to suppress noise from short alleles whose length variation is biological rather than pathological. Off by default.
+
+### `--min-support N`
+
+Drop alleles whose STRdust `SUP` (read support) field is below `N` before any clustering. Off by default. Useful for suppressing outlier calls driven by low-coverage assemblies that produced an unusual sequence by accident. `SUP` is read per-allele from the VCF FORMAT (one comma-separated value per called GT allele). Alleles whose `SUP` is missing or unparseable are treated as zero support and dropped — if you set this and your VCFs lack `SUP`, all alleles will be dropped and trout will warn loudly via the "Dropped N alleles" line printed to stderr.
+
+### `--summary FILE`
+
+Write a per-sample QC TSV to FILE with columns `sample`, `n_loci` (loci where the sample contributed at least one allele), `n_outlier` (loci where the sample was a DBSCAN noise point), and `outlier_rate` (n_outlier / n_loci). Sorted by outlier count desc. Samples flagged at many loci are usually QC issues (low coverage, contamination, swap) rather than biologically interesting — useful as a first pass before investigating individual loci. The QC counts ignore `--samples`, so controls are included alongside the samples-of-interest.
 
 ### `--samples SAMPLES`
 

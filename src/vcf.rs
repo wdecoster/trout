@@ -20,27 +20,33 @@ pub struct LocusData {
 /// (chrom, pos, end) -> locus data
 pub type LocusMap = HashMap<(String, u32, u32), LocusData>;
 
-pub fn read_vcfs(paths: &[PathBuf]) -> LocusMap {
+/// Read all VCFs in parallel. Returns the combined locus map plus the total number of alleles
+/// dropped by the `min_support` filter (0 when the filter is off).
+pub fn read_vcfs(paths: &[PathBuf], min_support: Option<u32>) -> (LocusMap, usize) {
     paths
         .par_iter()
-        .filter_map(|path| match read_vcf(path) {
-            Ok(m) => Some(m),
+        .filter_map(|path| match read_vcf(path, min_support) {
+            Ok(r) => Some(r),
             Err(e) => {
                 eprintln!("Warning: failed to read {}: {}", path.display(), e);
                 None
             }
         })
-        .reduce(LocusMap::new, |mut acc, local| {
-            for (key, data) in local {
-                match acc.entry(key) {
-                    Entry::Occupied(mut e) => e.get_mut().alleles.extend(data.alleles),
-                    Entry::Vacant(e) => {
-                        e.insert(data);
+        .reduce(
+            || (LocusMap::new(), 0usize),
+            |mut acc, (local, n_dropped)| {
+                for (key, data) in local {
+                    match acc.0.entry(key) {
+                        Entry::Occupied(mut e) => e.get_mut().alleles.extend(data.alleles),
+                        Entry::Vacant(e) => {
+                            e.insert(data);
+                        }
                     }
                 }
-            }
-            acc
-        })
+                acc.1 += n_dropped;
+                acc
+            },
+        )
 }
 
 fn reader(path: &Path) -> Result<Box<dyn BufRead>, std::io::Error> {
@@ -54,10 +60,14 @@ fn reader(path: &Path) -> Result<Box<dyn BufRead>, std::io::Error> {
     }
 }
 
-fn read_vcf(path: &Path) -> Result<LocusMap, Box<dyn std::error::Error + Send + Sync>> {
+fn read_vcf(
+    path: &Path,
+    min_support: Option<u32>,
+) -> Result<(LocusMap, usize), Box<dyn std::error::Error + Send + Sync>> {
     let rdr = reader(path)?;
     let mut sample_name = String::new();
     let mut locus_map = LocusMap::new();
+    let mut n_dropped = 0usize;
 
     for line_result in rdr.lines() {
         let line = line_result?;
@@ -106,6 +116,14 @@ fn read_vcf(path: &Path) -> Result<LocusMap, Box<dyn std::error::Error + Send + 
         }
 
         let allele_indices = parse_gt(gt_field);
+
+        // STRdust SUP is per-allele in GT order; parse lazily only when filtering is on.
+        let sup_values: Vec<u32> = if min_support.is_some() {
+            parse_sup(format, sample_field)
+        } else {
+            Vec::new()
+        };
+
         let key = (chrom, pos, end);
 
         let entry = locus_map.entry(key).or_insert_with(|| LocusData {
@@ -113,8 +131,19 @@ fn read_vcf(path: &Path) -> Result<LocusMap, Box<dyn std::error::Error + Send + 
             alleles: Vec::new(),
         });
 
-        for idx in allele_indices {
-            let seq = if idx == 0 {
+        for (i, idx) in allele_indices.iter().enumerate() {
+            if let Some(min) = min_support {
+                // Missing/unparseable SUP for this position counts as 0 support → dropped. This
+                // is intentional: if the user asked for a quality filter and the file can't
+                // supply the metric, we err on the side of caution rather than silently passing.
+                let sup = sup_values.get(i).copied().unwrap_or(0);
+                if sup < min {
+                    n_dropped += 1;
+                    continue;
+                }
+            }
+
+            let seq = if *idx == 0 {
                 ref_seq.to_string()
             } else {
                 match alt_seqs.get(idx - 1) {
@@ -130,7 +159,24 @@ fn read_vcf(path: &Path) -> Result<LocusMap, Box<dyn std::error::Error + Send + 
         }
     }
 
-    Ok(locus_map)
+    Ok((locus_map, n_dropped))
+}
+
+fn parse_sup(format: &str, sample_field: &str) -> Vec<u32> {
+    let sup_idx = match format.split(':').position(|f| f == "SUP") {
+        Some(i) => i,
+        None => return Vec::new(),
+    };
+    let sup_field = match sample_field.split(':').nth(sup_idx) {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+    // Negative or non-numeric SUP entries clamp to 0 (the strictest interpretation — they
+    // will be dropped under any positive --min-support).
+    sup_field
+        .split(',')
+        .map(|v| v.parse::<u32>().unwrap_or(0))
+        .collect()
 }
 
 fn parse_end(info: &str, pos: u32, ref_len: u32) -> u32 {

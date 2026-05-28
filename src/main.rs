@@ -104,6 +104,28 @@ struct Args {
     min_length: Option<usize>,
 
     #[arg(
+        long = "summary",
+        value_name = "FILE",
+        help = "Write a per-sample QC TSV to FILE: one row per sample with the number of loci \
+                where the sample contributed data, the number of loci where it was a DBSCAN \
+                noise point, and the resulting outlier rate. Sorted by outlier count desc. \
+                Samples flagged at many loci are typically QC issues (low coverage, \
+                contamination) rather than biologically interesting. The QC counts ignore the \
+                `--samples` filter, so controls are included."
+    )]
+    summary: Option<PathBuf>,
+
+    #[arg(
+        long = "min-support",
+        value_name = "N",
+        help = "Drop alleles whose STRdust SUP (read support) is below N. Off by default — set \
+                to suppress outlier calls driven by low-support assemblies. SUP is per-allele \
+                in the VCF FORMAT (one value per called GT allele); alleles whose SUP is \
+                missing or unparseable are treated as 0 support and dropped."
+    )]
+    min_support: Option<u32>,
+
+    #[arg(
         long = "samples",
         value_name = "SAMPLES",
         help = "Samples of interest: a sample name, a comma-separated list, or a path to a \
@@ -144,13 +166,24 @@ enum KSpec {
     Auto,
 }
 
+struct OutlierCall {
+    sample: String,
+    /// Raw allele length in bp.
+    allele_length: usize,
+    /// Feature axis with the largest deviation from the cluster mean for *this* allele.
+    top_axis: String,
+    /// Magnitude of that deviation in the normalized [0,1] feature space (length deviation
+    /// is divided by length_weight first so it's comparable to k-mer deviations).
+    deviation: f64,
+}
+
 struct LocusResult {
     chrom: String,
     pos: u32,
     end: u32,
     label: Option<String>,
-    outlier_samples: Vec<String>,
-    top_axis_names: Vec<String>,
+    /// One row per outlier allele (post `--samples` filter), sorted by deviation desc.
+    outlier_calls: Vec<OutlierCall>,
     n_outliers: usize,
     /// Each row: (sample, raw_length, feature_vector, is_outlier, k_used, k_source)
     feat_rows: Vec<(String, usize, Vec<f64>, bool, usize, features::KSource)>,
@@ -159,6 +192,11 @@ struct LocusResult {
     locus_k: usize,
     /// Whether k was detected, fell back to default, or specified by the user.
     k_source: features::KSource,
+    /// Sample names present at this locus, deduplicated (used by --summary).
+    unique_samples: Vec<String>,
+    /// Sample names flagged as DBSCAN noise at this locus, pre `--samples` filter (--summary).
+    /// `outlier_samples` above is post-filter and used for the main outliers TSV.
+    noise_samples: Vec<String>,
 }
 
 fn main() {
@@ -232,7 +270,13 @@ fn main() {
         n_vcfs, k_display, args.eps, min_samples, args.length_weight
     );
 
-    let locus_map = vcf::read_vcfs(&args.vcfs);
+    let (locus_map, n_dropped) = vcf::read_vcfs(&args.vcfs, args.min_support);
+    if let Some(min) = args.min_support {
+        eprintln!(
+            "Dropped {} alleles with SUP < {} (--min-support)",
+            n_dropped, min
+        );
+    }
     eprintln!("Loaded {} loci", locus_map.len());
 
     // Optional feature matrix writer — opened before the parallel section.
@@ -271,9 +315,9 @@ fn main() {
     let has_repeat = repeat_map.is_some();
 
     if has_repeat {
-        println!("chrom\tstart\tend\tname\tsamples\taxes");
+        println!("chrom\tstart\tend\tname\tsample\tallele_length\ttop_axis\tdeviation");
     } else {
-        println!("chrom\tstart\tend\tsamples\taxes");
+        println!("chrom\tstart\tend\tsample\tallele_length\ttop_axis\tdeviation");
     }
 
     let mut loci: Vec<_> = locus_map.into_iter().collect();
@@ -368,23 +412,49 @@ fn main() {
                 is_noise.iter_mut().for_each(|n| *n = false);
             }
 
-            let top_axis_names: Vec<String> = locus_top_axes.into_iter().map(|(n, _)| n).collect();
+            let _ = locus_top_axes; // locus-level axes are only used for the suppression above
 
-            // Collect outlier samples, restricted to --samples list when provided.
-            let mut seen: HashSet<&str> = HashSet::new();
-            let mut outlier_samples: Vec<String> = Vec::new();
-            for (allele, &noise) in alleles.iter().zip(is_noise.iter()) {
-                if noise && seen.insert(allele.sample.as_str()) {
-                    let in_list = samples_of_interest
-                        .as_ref()
-                        .map(|s| s.contains(&allele.sample))
-                        .unwrap_or(true);
-                    if in_list {
-                        outlier_samples.push(allele.sample.clone());
-                    }
+            // Per-allele outlier records (one row per noise allele, post `--samples` filter).
+            // We don't deduplicate by sample here so a hom-outlier sample appears twice — that
+            // is itself a signal worth surfacing in the output.
+            // noise_samples (for --summary) is independently sample-deduplicated and ignores
+            // `--samples` so QC reflects the whole cohort.
+            let mut seen_noise: HashSet<&str> = HashSet::new();
+            let mut noise_samples: Vec<String> = Vec::new();
+            let mut outlier_calls: Vec<OutlierCall> = Vec::new();
+            for ((allele, &noise), point) in alleles.iter().zip(is_noise.iter()).zip(points.iter())
+            {
+                if !noise {
+                    continue;
                 }
+                if seen_noise.insert(allele.sample.as_str()) {
+                    noise_samples.push(allele.sample.clone());
+                }
+                let in_list = samples_of_interest
+                    .as_ref()
+                    .map(|s| s.contains(&allele.sample))
+                    .unwrap_or(true);
+                if !in_list {
+                    continue;
+                }
+                let (top_axis, deviation) =
+                    per_point_top_axis(point, &cluster_mean, locus_names, length_weight);
+                outlier_calls.push(OutlierCall {
+                    sample: allele.sample.clone(),
+                    allele_length: allele.seq.len(),
+                    top_axis,
+                    deviation,
+                });
             }
-            let n_outliers = outlier_samples.len();
+            // Sort within locus by deviation desc so the most extreme calls appear first; tie
+            // break on sample name for determinism.
+            outlier_calls.sort_by(|a, b| {
+                b.deviation
+                    .partial_cmp(&a.deviation)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.sample.cmp(&b.sample))
+            });
+            let n_outliers = outlier_calls.len();
 
             let feat_rows = if need_feat_rows {
                 let mut rows: Vec<(String, usize, Vec<f64>, bool, usize, features::KSource)> =
@@ -414,7 +484,7 @@ fn main() {
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| format!("{}:{}-{}", chrom, pos, end));
 
-            let plot_data = if collect_plots && !outlier_samples.is_empty() {
+            let plot_data = if collect_plots && n_outliers > 0 {
                 build_plot_data(
                     &alleles,
                     &points,
@@ -430,18 +500,22 @@ fn main() {
                 Vec::new()
             };
 
+            let unique_samples_vec: Vec<String> =
+                unique_samples.iter().map(|s| s.to_string()).collect();
+
             Some(LocusResult {
                 chrom,
                 pos,
                 end,
                 label,
-                outlier_samples,
-                top_axis_names,
+                outlier_calls,
                 n_outliers,
                 feat_rows,
                 plot_data,
                 locus_k,
                 k_source,
+                unique_samples: unique_samples_vec,
+                noise_samples,
             })
         })
         .collect();
@@ -452,36 +526,54 @@ fn main() {
     // (k, source) -> count, so the auto-k summary can show e.g. k=2 detected separately from
     // k=2 fallback. In non-auto mode this is unused.
     let mut k_histogram: BTreeMap<(usize, features::KSource), usize> = BTreeMap::new();
+    // sample -> (n_loci_with_data, n_loci_flagged_noise) for --summary.
+    let collect_summary = args.summary.is_some();
+    let mut sample_stats: HashMap<String, (usize, usize)> = HashMap::new();
 
     for result in results {
         *k_histogram
             .entry((result.locus_k, result.k_source))
             .or_insert(0) += 1;
-        if !result.outlier_samples.is_empty() {
-            if has_repeat {
-                let name = result.label.as_deref().unwrap_or(".");
-                println!(
-                    "{}\t{}\t{}\t{}\t{}\t{}",
-                    result.chrom,
-                    result.pos,
-                    result.end,
-                    name,
-                    result.outlier_samples.join(","),
-                    result.top_axis_names.join(",")
-                );
-            } else {
-                println!(
-                    "{}\t{}\t{}\t{}\t{}",
-                    result.chrom,
-                    result.pos,
-                    result.end,
-                    result.outlier_samples.join(","),
-                    result.top_axis_names.join(",")
-                );
+
+        if collect_summary {
+            for s in &result.unique_samples {
+                sample_stats.entry(s.clone()).or_insert((0, 0)).0 += 1;
+            }
+            for s in &result.noise_samples {
+                sample_stats.entry(s.clone()).or_insert((0, 0)).1 += 1;
+            }
+        }
+
+        if !result.outlier_calls.is_empty() {
+            for call in &result.outlier_calls {
+                if has_repeat {
+                    let name = result.label.as_deref().unwrap_or(".");
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}",
+                        result.chrom,
+                        result.pos,
+                        result.end,
+                        name,
+                        call.sample,
+                        call.allele_length,
+                        call.top_axis,
+                        call.deviation,
+                    );
+                } else {
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{:.4}",
+                        result.chrom,
+                        result.pos,
+                        result.end,
+                        call.sample,
+                        call.allele_length,
+                        call.top_axis,
+                        call.deviation,
+                    );
+                }
             }
             total_outliers += result.n_outliers;
         }
-
         if let Some(ref mut w) = feat_writer {
             let name_col = result.label.as_deref().unwrap_or(".");
             for (sample, raw_len, point, noise, row_k, row_src) in &result.feat_rows {
@@ -540,8 +632,35 @@ fn main() {
 
     eprintln!("Done: {} outlier calls", total_outliers);
 
+    if let Some(ref path) = args.summary {
+        write_summary(path, &sample_stats);
+    }
+
     if let Some(ref path) = args.plot {
         plot::render_scatter_plots(&plot_loci, path);
+    }
+}
+
+fn write_summary(path: &Path, stats: &HashMap<String, (usize, usize)>) {
+    let f = std::fs::File::create(path).expect("Cannot create summary file");
+    let mut w = BufWriter::new(f);
+    writeln!(w, "sample\tn_loci\tn_outlier\toutlier_rate").unwrap();
+    let mut rows: Vec<(&String, usize, usize, f64)> = stats
+        .iter()
+        .map(|(s, (l, o))| {
+            let rate = if *l > 0 { *o as f64 / *l as f64 } else { 0.0 };
+            (s, *l, *o, rate)
+        })
+        .collect();
+    // Sort by outlier count desc (the QC signal), then rate desc as tiebreaker so a sample
+    // flagged 5/10 ranks above one flagged 5/100.
+    rows.sort_by(|a, b| {
+        b.2.cmp(&a.2)
+            .then(b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal))
+            .then(a.0.cmp(b.0))
+    });
+    for (sample, n_loci, n_outlier, rate) in rows {
+        writeln!(w, "{}\t{}\t{}\t{:.4}", sample, n_loci, n_outlier, rate).unwrap();
     }
 }
 
