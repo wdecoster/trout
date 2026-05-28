@@ -20,3 +20,9 @@ rayon = "1"
 lto = true
 codegen-units = 1
 panic = "abort"
+
+# For perf/flamegraph profiling: inherits release optimisations, adds DWARF symbols so
+# inlined frames resolve to source line numbers.
+[profile.profiling]
+inherits = "release"
+debug = true
