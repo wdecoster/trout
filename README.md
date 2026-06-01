@@ -17,7 +17,7 @@ trout [OPTIONS] cohort/*.vcf.gz > outliers.tsv
 
 ## Output
 
-The main output is tab-separated to stdout, with **one row per outlier allele**:
+The main output is tab-separated to stdout, with **one row per outlier sample per locus**:
 
 | Column | Description |
 |--------|-------------|
@@ -25,12 +25,13 @@ The main output is tab-separated to stdout, with **one row per outlier allele**:
 | `start` | Locus start (VCF POS, 1-based) |
 | `end` | Locus end (from VCF INFO END) |
 | `name` | Repeat name from `--repeat` file (only present when `--repeat` is used; `.` if locus has no entry) |
-| `sample` | Sample carrying this outlier allele |
-| `allele_length` | Length of the outlier allele in bp |
-| `top_axis` | Feature axis with the largest deviation from the cluster mean for *this* allele (e.g. `length` for an expansion, or a k-mer name like `CGG` for a composition outlier) |
+| `sample` | Sample carrying the outlier |
+| `allele_length` | Length in bp of the sample's most-deviant flagged allele |
+| `top_axis` | Feature axis with the largest deviation from the cluster mean for that allele (e.g. `length` for an expansion, or a k-mer name like `CGG` for a composition outlier) |
 | `deviation` | Magnitude of that deviation in the normalized [0,1] feature space (length deviation is rescaled by `--length-weight` for fair comparison with k-mer deviations) |
+| `zygosity` | Genotype zygosity at the locus: `hom` (alleles identical), `het` (alleles differ, including compound-het expansions), or `hemi` (a single allele was called, e.g. haploid chrX/Y) |
 
-Rows are grouped by locus and within a locus sorted by `deviation` descending, so the most extreme calls appear first. A sample with both alleles flagged produces two rows — itself a useful biallelic signal. Only loci with at least one outlier are printed.
+Rows are grouped by locus and within a locus sorted by `deviation` descending, so the most extreme calls appear first. A sample with both alleles flagged is reported as a single row — `zygosity` carries the biallelic signal (`hom` for a homozygous expansion, `het` for a compound het, where `allele_length`/`deviation` describe the more-deviant allele). Loci are emitted in genome/contig order (the `##contig` order of the input VCFs). Only loci with at least one outlier are printed.
 
 ## Options
 

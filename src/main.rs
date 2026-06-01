@@ -138,7 +138,7 @@ struct Args {
     #[arg(
         long = "threads",
         value_name = "N",
-        help = "Number of parallel threads for VCF loading and per-locus processing \
+        help = "Number of parallel threads for per-locus processing \
                 [default: all available CPUs]"
     )]
     threads: Option<usize>,
@@ -168,13 +168,18 @@ enum KSpec {
 
 struct OutlierCall {
     sample: String,
-    /// Raw allele length in bp.
+    /// Raw allele length in bp of the sample's most-deviant flagged allele (the one this row
+    /// represents). For a hom outlier both alleles are identical; for a compound het the longer/
+    /// more-deviant of the two flagged alleles is reported and `zygosity` records that it is het.
     allele_length: usize,
-    /// Feature axis with the largest deviation from the cluster mean for *this* allele.
+    /// Feature axis with the largest deviation from the cluster mean for the represented allele.
     top_axis: String,
     /// Magnitude of that deviation in the normalized [0,1] feature space (length deviation
     /// is divided by length_weight first so it's comparable to k-mer deviations).
     deviation: f64,
+    /// Genotype zygosity of the sample at this locus: "hom" (alleles identical), "het" (alleles
+    /// differ), or "hemi" (a single allele was called, e.g. haploid chrX/Y).
+    zygosity: &'static str,
 }
 
 struct LocusResult {
@@ -202,6 +207,11 @@ struct LocusResult {
 fn main() {
     env_logger::init();
     let args = Args::parse();
+
+    // The k-way merge holds every input VCF open at once. Raise our own open-file soft limit to
+    // the hard limit so cohorts larger than the default 1024 ulimit just work without the user
+    // having to run `ulimit -n` first. Best-effort: any failure leaves the limit untouched.
+    raise_fd_limit();
 
     if let Some(n) = args.threads {
         rayon::ThreadPoolBuilder::new()
@@ -270,14 +280,13 @@ fn main() {
         n_vcfs, k_display, args.eps, min_samples, args.length_weight
     );
 
-    let (locus_map, n_dropped) = vcf::read_vcfs(&args.vcfs, args.min_support);
-    if let Some(min) = args.min_support {
-        eprintln!(
-            "Dropped {} alleles with SUP < {} (--min-support)",
-            n_dropped, min
-        );
-    }
-    eprintln!("Loaded {} loci", locus_map.len());
+    let mut merger = match vcf::VcfMerger::open(&args.vcfs, args.min_support) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
 
     // Optional feature matrix writer — opened before the parallel section.
     let mut feat_writer: Option<BufWriter<Box<dyn Write>>> = args.features_out.as_ref().map(|p| {
@@ -304,6 +313,7 @@ fn main() {
     });
     let need_feat_rows = feat_writer.is_some();
     let collect_plots = args.plot.is_some();
+    let collect_summary = args.summary.is_some();
 
     // Copy scalars so the parallel closure doesn't need to borrow Args.
     let eps = args.eps;
@@ -315,312 +325,352 @@ fn main() {
     let has_repeat = repeat_map.is_some();
 
     if has_repeat {
-        println!("chrom\tstart\tend\tname\tsample\tallele_length\ttop_axis\tdeviation");
+        println!("chrom\tstart\tend\tname\tsample\tallele_length\ttop_axis\tdeviation\tzygosity");
     } else {
-        println!("chrom\tstart\tend\tsample\tallele_length\ttop_axis\tdeviation");
+        println!("chrom\tstart\tend\tsample\tallele_length\ttop_axis\tdeviation\tzygosity");
     }
 
-    let mut loci: Vec<_> = locus_map.into_iter().collect();
-    loci.sort_unstable_by(|a, b| {
-        let (ca, pa, ea) = &a.0;
-        let (cb, pb, eb) = &b.0;
-        cmp_chrom(ca, cb)
-            .then_with(|| pa.cmp(pb))
-            .then_with(|| ea.cmp(eb))
-    });
+    // Each locus is fully independent: feature computation, DBSCAN, and plot-data generation are
+    // all embarrassingly parallel. The merger yields loci already in genome order, so we process
+    // them in bounded batches: rayon parallelises within a batch (and preserves order), while the
+    // batch boundary caps peak memory at one batch of alleles instead of the whole cohort.
+    let process_locus = |((chrom, pos, end), locus_data): vcf::LocusEntry| -> Option<LocusResult> {
+        let chrom = String::from(chrom);
+        let vcf::LocusData { ref_seq, alleles } = locus_data;
 
-    // Each locus is fully independent: feature computation, DBSCAN, and plot data
-    // generation are all embarrassingly parallel. Results are collected in sorted
-    // order (rayon preserves input order for into_par_iter + collect).
-    let results: Vec<LocusResult> = loci
-        .into_par_iter()
-        .filter_map(|((chrom, pos, end), locus_data)| {
-            let vcf::LocusData { ref_seq, alleles } = locus_data;
+        let unique_samples: HashSet<&str> = alleles.iter().map(|a| a.sample.as_ref()).collect();
+        if unique_samples.len() < min_locus_samples {
+            return None;
+        }
 
-            let unique_samples: HashSet<&str> = alleles.iter().map(|a| a.sample.as_str()).collect();
-            if unique_samples.len() < min_locus_samples {
-                return None;
-            }
+        let max_len = alleles.iter().map(|a| a.seq.len()).max().unwrap_or(1);
+        if max_len == 0 {
+            return None;
+        }
 
-            let max_len = alleles.iter().map(|a| a.seq.len()).max().unwrap_or(1);
-            if max_len == 0 {
-                return None;
-            }
-
-            // Per-locus k precedence:
-            //   1. --repeat row's explicit k (most authoritative — user-curated)
-            //   2. auto detection from REF + median-length allele (-k auto)
-            //   3. global -k value
-            let repeat_entry = repeat_map
-                .as_ref()
-                .and_then(|rm| rm.get(&(chrom.clone(), pos, end)));
-            let (locus_k, k_source) = if let Some(e) = repeat_entry {
-                (e.k, features::KSource::User)
-            } else {
-                match k_spec {
-                    KSpec::Fixed(k) => (k, features::KSource::User),
-                    KSpec::Auto => {
-                        let median = median_length_allele(&alleles);
-                        features::detect_locus_k(&ref_seq, median)
-                    }
+        // Per-locus k precedence:
+        //   1. --repeat row's explicit k (most authoritative — user-curated)
+        //   2. auto detection from REF + median-length allele (-k auto)
+        //   3. global -k value
+        let repeat_entry = repeat_map
+            .as_ref()
+            .and_then(|rm| rm.get(&(chrom.clone(), pos, end)));
+        let (locus_k, k_source) = if let Some(e) = repeat_entry {
+            (e.k, features::KSource::User)
+        } else {
+            match k_spec {
+                KSpec::Fixed(k) => (k, features::KSource::User),
+                KSpec::Auto => {
+                    let median = median_length_allele(&alleles);
+                    features::detect_locus_k(&ref_seq, median)
                 }
-            };
-            let locus_table = kmer_tables.get(&locus_k).unwrap();
-            let locus_names = kmer_names.get(&locus_k).unwrap();
-            let label = repeat_entry.map(|e| e.name.clone());
+            }
+        };
+        let locus_table = kmer_tables.get(&locus_k).unwrap();
+        let locus_names = kmer_names.get(&locus_k).unwrap();
+        let label = repeat_entry.map(|e| e.name.clone());
 
-            let points: Vec<Vec<f64>> = alleles
+        let points: Vec<Vec<f64>> = alleles
+            .iter()
+            .map(|a| {
+                features::build_feature_vector(&a.seq, locus_table, locus_k, max_len, length_weight)
+            })
+            .collect();
+
+        let mut is_noise = outlier::find_outliers(&points, eps, min_samples);
+
+        // --min-length: clear the noise flag for alleles shorter than the cutoff.
+        if let Some(min_len) = min_length {
+            for (noise, allele) in is_noise.iter_mut().zip(alleles.iter()) {
+                if *noise && allele.seq.len() < min_len {
+                    *noise = false;
+                }
+            }
+        }
+
+        let cluster_mean = cluster_mean(&points, &is_noise);
+        let locus_top_axes = top_axes(
+            &points,
+            &is_noise,
+            &cluster_mean,
+            locus_names,
+            2,
+            length_weight,
+        );
+
+        if let Some(thresh) = min_axis_dev
+            && locus_top_axes
+                .first()
+                .map(|(_, dev)| *dev < thresh)
+                .unwrap_or(true)
+        {
+            is_noise.iter_mut().for_each(|n| *n = false);
+        }
+
+        let _ = locus_top_axes; // locus-level axes are only used for the suppression above
+
+        // One outlier record per *sample* (not per allele): a homozygous expansion would
+        // otherwise emit two byte-identical rows. We group each sample's alleles at the locus,
+        // derive zygosity from the full genotype, and report the sample's most-deviant flagged
+        // allele. noise_samples (for --summary) is the set of flagged samples and ignores the
+        // `--samples` filter so QC reflects the whole cohort.
+        struct SampleAgg<'a> {
+            /// All of the sample's allele sequences at this locus (flagged or not) — used to
+            /// classify zygosity.
+            seqs: Vec<&'a str>,
+            /// Flagged (DBSCAN-noise) alleles: (length, feature point) for the represented-allele
+            /// pick. Empty if the sample has no outlier allele here.
+            flagged: Vec<(usize, &'a Vec<f64>)>,
+        }
+        let mut by_sample: HashMap<&str, SampleAgg> = HashMap::new();
+        for ((allele, &noise), point) in alleles.iter().zip(is_noise.iter()).zip(points.iter()) {
+            let agg = by_sample
+                .entry(allele.sample.as_ref())
+                .or_insert_with(|| SampleAgg {
+                    seqs: Vec::new(),
+                    flagged: Vec::new(),
+                });
+            agg.seqs.push(&allele.seq);
+            if noise {
+                agg.flagged.push((allele.seq.len(), point));
+            }
+        }
+
+        let mut noise_samples: Vec<String> = Vec::new();
+        let mut outlier_calls: Vec<OutlierCall> = Vec::new();
+        for (sample, agg) in &by_sample {
+            if agg.flagged.is_empty() {
+                continue;
+            }
+            if collect_summary {
+                noise_samples.push(sample.to_string());
+            }
+            let in_list = samples_of_interest
+                .as_ref()
+                .map(|s| s.contains(*sample))
+                .unwrap_or(true);
+            if !in_list {
+                continue;
+            }
+            // Represent the sample by its most-deviant flagged allele.
+            let mut best: Option<(usize, String, f64)> = None;
+            for (len, point) in &agg.flagged {
+                let (top_axis, deviation) =
+                    per_point_top_axis(point, &cluster_mean, locus_names, length_weight);
+                if best.as_ref().is_none_or(|(_, _, d)| deviation > *d) {
+                    best = Some((*len, top_axis, deviation));
+                }
+            }
+            let (allele_length, top_axis, deviation) = best.unwrap();
+            outlier_calls.push(OutlierCall {
+                sample: sample.to_string(),
+                allele_length,
+                top_axis,
+                deviation,
+                zygosity: zygosity(&agg.seqs),
+            });
+        }
+        // Sort within locus by deviation desc so the most extreme calls appear first; tie
+        // break on sample name for determinism (HashMap iteration order is unstable).
+        outlier_calls.sort_by(|a, b| {
+            b.deviation
+                .partial_cmp(&a.deviation)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.sample.cmp(&b.sample))
+        });
+        let n_outliers = outlier_calls.len();
+
+        let feat_rows = if need_feat_rows {
+            let mut rows: Vec<(String, usize, Vec<f64>, bool, usize, features::KSource)> = alleles
                 .iter()
-                .map(|a| {
-                    features::build_feature_vector(
-                        &a.seq,
-                        locus_table,
+                .zip(points.iter())
+                .zip(is_noise.iter())
+                .map(|((a, pt), &noise)| {
+                    (
+                        a.sample.to_string(),
+                        a.seq.len(),
+                        pt.clone(),
+                        noise,
                         locus_k,
-                        max_len,
-                        length_weight,
+                        k_source,
                     )
                 })
                 .collect();
+            rows.sort_by(|(a, _, _, _, _, _), (b, _, _, _, _, _)| a.cmp(b));
+            rows
+        } else {
+            Vec::new()
+        };
 
-            let mut is_noise = outlier::find_outliers(&points, eps, min_samples);
+        let title_prefix = label
+            .as_deref()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("{}:{}-{}", chrom, pos, end));
 
-            // --min-length: clear the noise flag for alleles shorter than the cutoff.
-            if let Some(min_len) = min_length {
-                for (noise, allele) in is_noise.iter_mut().zip(alleles.iter()) {
-                    if *noise && allele.seq.len() < min_len {
-                        *noise = false;
-                    }
-                }
-            }
-
-            let cluster_mean = cluster_mean(&points, &is_noise);
-            let locus_top_axes = top_axes(
+        let plot_data = if collect_plots && n_outliers > 0 {
+            build_plot_data(
+                &alleles,
                 &points,
                 &is_noise,
                 &cluster_mean,
                 locus_names,
-                2,
+                &title_prefix,
                 length_weight,
-            );
+                min_axis_dev,
+                &samples_of_interest,
+            )
+        } else {
+            Vec::new()
+        };
 
-            if let Some(thresh) = min_axis_dev
-                && locus_top_axes
-                    .first()
-                    .map(|(_, dev)| *dev < thresh)
-                    .unwrap_or(true)
-            {
-                is_noise.iter_mut().for_each(|n| *n = false);
-            }
+        // Only materialised for --summary; otherwise these per-locus sample lists would hold
+        // ~one String per sample for every locus in the results vector for no reason.
+        let unique_samples_vec: Vec<String> = if collect_summary {
+            unique_samples.iter().map(|s| s.to_string()).collect()
+        } else {
+            Vec::new()
+        };
 
-            let _ = locus_top_axes; // locus-level axes are only used for the suppression above
-
-            // Per-allele outlier records (one row per noise allele, post `--samples` filter).
-            // We don't deduplicate by sample here so a hom-outlier sample appears twice — that
-            // is itself a signal worth surfacing in the output.
-            // noise_samples (for --summary) is independently sample-deduplicated and ignores
-            // `--samples` so QC reflects the whole cohort.
-            let mut seen_noise: HashSet<&str> = HashSet::new();
-            let mut noise_samples: Vec<String> = Vec::new();
-            let mut outlier_calls: Vec<OutlierCall> = Vec::new();
-            for ((allele, &noise), point) in alleles.iter().zip(is_noise.iter()).zip(points.iter())
-            {
-                if !noise {
-                    continue;
-                }
-                if seen_noise.insert(allele.sample.as_str()) {
-                    noise_samples.push(allele.sample.clone());
-                }
-                let in_list = samples_of_interest
-                    .as_ref()
-                    .map(|s| s.contains(&allele.sample))
-                    .unwrap_or(true);
-                if !in_list {
-                    continue;
-                }
-                let (top_axis, deviation) =
-                    per_point_top_axis(point, &cluster_mean, locus_names, length_weight);
-                outlier_calls.push(OutlierCall {
-                    sample: allele.sample.clone(),
-                    allele_length: allele.seq.len(),
-                    top_axis,
-                    deviation,
-                });
-            }
-            // Sort within locus by deviation desc so the most extreme calls appear first; tie
-            // break on sample name for determinism.
-            outlier_calls.sort_by(|a, b| {
-                b.deviation
-                    .partial_cmp(&a.deviation)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then(a.sample.cmp(&b.sample))
-            });
-            let n_outliers = outlier_calls.len();
-
-            let feat_rows = if need_feat_rows {
-                let mut rows: Vec<(String, usize, Vec<f64>, bool, usize, features::KSource)> =
-                    alleles
-                        .iter()
-                        .zip(points.iter())
-                        .zip(is_noise.iter())
-                        .map(|((a, pt), &noise)| {
-                            (
-                                a.sample.clone(),
-                                a.seq.len(),
-                                pt.clone(),
-                                noise,
-                                locus_k,
-                                k_source,
-                            )
-                        })
-                        .collect();
-                rows.sort_by(|(a, _, _, _, _, _), (b, _, _, _, _, _)| a.cmp(b));
-                rows
-            } else {
-                Vec::new()
-            };
-
-            let title_prefix = label
-                .as_deref()
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| format!("{}:{}-{}", chrom, pos, end));
-
-            let plot_data = if collect_plots && n_outliers > 0 {
-                build_plot_data(
-                    &alleles,
-                    &points,
-                    &is_noise,
-                    &cluster_mean,
-                    locus_names,
-                    &title_prefix,
-                    length_weight,
-                    min_axis_dev,
-                    &samples_of_interest,
-                )
-            } else {
-                Vec::new()
-            };
-
-            let unique_samples_vec: Vec<String> =
-                unique_samples.iter().map(|s| s.to_string()).collect();
-
-            Some(LocusResult {
-                chrom,
-                pos,
-                end,
-                label,
-                outlier_calls,
-                n_outliers,
-                feat_rows,
-                plot_data,
-                locus_k,
-                k_source,
-                unique_samples: unique_samples_vec,
-                noise_samples,
-            })
+        Some(LocusResult {
+            chrom,
+            pos,
+            end,
+            label,
+            outlier_calls,
+            n_outliers,
+            feat_rows,
+            plot_data,
+            locus_k,
+            k_source,
+            unique_samples: unique_samples_vec,
+            noise_samples,
         })
-        .collect();
+    };
 
-    // Sequential output: order is preserved from the sorted loci input.
+    // Output is emitted batch by batch; genome order is preserved across batch boundaries because
+    // the merger yields loci in order and rayon's collect keeps within-batch order.
     let mut total_outliers = 0usize;
     let mut plot_loci: Vec<plot::LocusPlotData> = Vec::new();
     // (k, source) -> count, so the auto-k summary can show e.g. k=2 detected separately from
     // k=2 fallback. In non-auto mode this is unused.
     let mut k_histogram: BTreeMap<(usize, features::KSource), usize> = BTreeMap::new();
     // sample -> (n_loci_with_data, n_loci_flagged_noise) for --summary.
-    let collect_summary = args.summary.is_some();
     let mut sample_stats: HashMap<String, (usize, usize)> = HashMap::new();
+    let mut n_loci = 0usize;
 
-    for result in results {
-        *k_histogram
-            .entry((result.locus_k, result.k_source))
-            .or_insert(0) += 1;
-
-        if collect_summary {
-            for s in &result.unique_samples {
-                sample_stats.entry(s.clone()).or_insert((0, 0)).0 += 1;
-            }
-            for s in &result.noise_samples {
-                sample_stats.entry(s.clone()).or_insert((0, 0)).1 += 1;
-            }
+    // Loci per batch: bounds peak memory to ~BATCH_SIZE × samples alleles. Large enough to keep
+    // all cores busy, small enough that one batch of alleles is cheap to hold.
+    const BATCH_SIZE: usize = 4096;
+    loop {
+        let batch = merger.next_batch(BATCH_SIZE);
+        if batch.is_empty() {
+            break;
         }
+        n_loci += batch.len();
+        let results: Vec<LocusResult> = batch.into_par_iter().filter_map(&process_locus).collect();
 
-        if !result.outlier_calls.is_empty() {
-            for call in &result.outlier_calls {
-                if has_repeat {
-                    let name = result.label.as_deref().unwrap_or(".");
-                    println!(
-                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}",
-                        result.chrom,
-                        result.pos,
-                        result.end,
-                        name,
-                        call.sample,
-                        call.allele_length,
-                        call.top_axis,
-                        call.deviation,
-                    );
-                } else {
-                    println!(
-                        "{}\t{}\t{}\t{}\t{}\t{}\t{:.4}",
-                        result.chrom,
-                        result.pos,
-                        result.end,
-                        call.sample,
-                        call.allele_length,
-                        call.top_axis,
-                        call.deviation,
-                    );
+        for result in results {
+            *k_histogram
+                .entry((result.locus_k, result.k_source))
+                .or_insert(0) += 1;
+
+            if collect_summary {
+                for s in &result.unique_samples {
+                    sample_stats.entry(s.clone()).or_insert((0, 0)).0 += 1;
+                }
+                for s in &result.noise_samples {
+                    sample_stats.entry(s.clone()).or_insert((0, 0)).1 += 1;
                 }
             }
-            total_outliers += result.n_outliers;
-        }
-        if let Some(ref mut w) = feat_writer {
-            let name_col = result.label.as_deref().unwrap_or(".");
-            for (sample, raw_len, point, noise, row_k, row_src) in &result.feat_rows {
-                if has_repeat {
-                    write!(
-                        w,
-                        "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                        result.chrom,
-                        result.pos,
-                        result.end,
-                        name_col,
-                        sample,
-                        *noise as u8,
-                        raw_len
-                    )
-                    .unwrap();
-                } else {
-                    write!(
-                        w,
-                        "{}\t{}\t{}\t{}\t{}\t{}",
-                        result.chrom, result.pos, result.end, sample, *noise as u8, raw_len
-                    )
-                    .unwrap();
-                }
-                if multi_k {
-                    // Key=value column: the k used at this locus plus the canonical k-mer
-                    // frequencies. point[0] is the (weighted) length feature; skip it.
-                    let row_names = kmer_names.get(row_k).unwrap();
-                    let kv = point
-                        .iter()
-                        .zip(row_names.iter())
-                        .skip(1)
-                        .map(|(v, n)| format!("{}={:.3}", n, v))
-                        .collect::<Vec<_>>()
-                        .join(";");
-                    write!(w, "\t{}\t{}\t{}", row_k, row_src.label(), kv).unwrap();
-                } else {
-                    for v in point.iter().skip(1) {
-                        write!(w, "\t{:.6}", v).unwrap();
+
+            if !result.outlier_calls.is_empty() {
+                for call in &result.outlier_calls {
+                    if has_repeat {
+                        let name = result.label.as_deref().unwrap_or(".");
+                        println!(
+                            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}",
+                            result.chrom,
+                            result.pos,
+                            result.end,
+                            name,
+                            call.sample,
+                            call.allele_length,
+                            call.top_axis,
+                            call.deviation,
+                            call.zygosity,
+                        );
+                    } else {
+                        println!(
+                            "{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}",
+                            result.chrom,
+                            result.pos,
+                            result.end,
+                            call.sample,
+                            call.allele_length,
+                            call.top_axis,
+                            call.deviation,
+                            call.zygosity,
+                        );
                     }
                 }
-                writeln!(w).unwrap();
+                total_outliers += result.n_outliers;
             }
-        }
+            if let Some(ref mut w) = feat_writer {
+                let name_col = result.label.as_deref().unwrap_or(".");
+                for (sample, raw_len, point, noise, row_k, row_src) in &result.feat_rows {
+                    if has_repeat {
+                        write!(
+                            w,
+                            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                            result.chrom,
+                            result.pos,
+                            result.end,
+                            name_col,
+                            sample,
+                            *noise as u8,
+                            raw_len
+                        )
+                        .unwrap();
+                    } else {
+                        write!(
+                            w,
+                            "{}\t{}\t{}\t{}\t{}\t{}",
+                            result.chrom, result.pos, result.end, sample, *noise as u8, raw_len
+                        )
+                        .unwrap();
+                    }
+                    if multi_k {
+                        // Key=value column: the k used at this locus plus the canonical k-mer
+                        // frequencies. point[0] is the (weighted) length feature; skip it.
+                        let row_names = kmer_names.get(row_k).unwrap();
+                        let kv = point
+                            .iter()
+                            .zip(row_names.iter())
+                            .skip(1)
+                            .map(|(v, n)| format!("{}={:.3}", n, v))
+                            .collect::<Vec<_>>()
+                            .join(";");
+                        write!(w, "\t{}\t{}\t{}", row_k, row_src.label(), kv).unwrap();
+                    } else {
+                        for v in point.iter().skip(1) {
+                            write!(w, "\t{:.6}", v).unwrap();
+                        }
+                    }
+                    writeln!(w).unwrap();
+                }
+            }
 
-        plot_loci.extend(result.plot_data);
+            plot_loci.extend(result.plot_data);
+        }
     }
+
+    if let Some(min) = args.min_support {
+        eprintln!(
+            "Dropped {} alleles with SUP < {} (--min-support)",
+            merger.n_dropped, min
+        );
+    }
+    eprintln!("Processed {} loci", n_loci);
 
     if matches!(k_spec, KSpec::Auto) {
         let parts: Vec<String> = k_histogram
@@ -680,7 +730,7 @@ fn build_plot_data(
         .iter()
         .zip(points.iter())
         .zip(is_noise.iter())
-        .map(|((a, pt), &noise)| (a.sample.as_str(), a.seq.len(), pt, noise))
+        .map(|((a, pt), &noise)| (a.sample.as_ref(), a.seq.len(), pt, noise))
         .collect();
     pts.sort_by_key(|(s, _, _, _)| *s);
 
@@ -983,13 +1033,51 @@ fn median_length_allele(alleles: &[vcf::Allele]) -> &str {
     &by_len[by_len.len() / 2].seq
 }
 
-fn cmp_chrom(a: &str, b: &str) -> std::cmp::Ordering {
-    let a = a.strip_prefix("chr").unwrap_or(a);
-    let b = b.strip_prefix("chr").unwrap_or(b);
-    match (a.parse::<u64>(), b.parse::<u64>()) {
-        (Ok(na), Ok(nb)) => na.cmp(&nb),
-        (Ok(_), Err(_)) => std::cmp::Ordering::Less,
-        (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
-        (Err(_), Err(_)) => a.cmp(b),
+/// Classify a sample's genotype at a locus from its allele sequences: "hom" when all alleles are
+/// identical, "het" when they differ, "hemi" when only a single allele was called (haploid chrX/Y
+/// or a single-allele genotype). Compares by sequence so a compound het of two equal-length but
+/// different motifs is correctly "het".
+fn zygosity(seqs: &[&str]) -> &'static str {
+    match seqs.split_first() {
+        None => "NA",
+        Some((_, [])) => "hemi",
+        Some((first, rest)) => {
+            if rest.iter().all(|s| s == first) {
+                "hom"
+            } else {
+                "het"
+            }
+        }
     }
 }
+
+/// Raise the soft `RLIMIT_NOFILE` to the hard limit (or a sane cap), so the all-files-open merge
+/// can handle large cohorts without the user touching `ulimit`. A process may always raise its own
+/// soft limit up to the hard limit without privileges. Best-effort; failures are ignored.
+#[cfg(unix)]
+fn raise_fd_limit() {
+    // If the hard limit is "unlimited", target a concrete value: setting the cur limit above the
+    // kernel's fs.nr_open (default 1048576 on Linux) is rejected, so don't ask for infinity.
+    const TARGET_CAP: libc::rlim_t = 1 << 20;
+    unsafe {
+        let mut rl = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, rl.as_mut_ptr()) != 0 {
+            return;
+        }
+        let mut rl = rl.assume_init();
+        let target = if rl.rlim_max == libc::RLIM_INFINITY {
+            TARGET_CAP
+        } else {
+            rl.rlim_max
+        };
+        if rl.rlim_cur < target {
+            rl.rlim_cur = target;
+            // Ignore the result: if the kernel rejects it the original (lower) limit still holds
+            // and VcfMerger::open will surface a clear EMFILE message if we then run short.
+            let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &rl);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn raise_fd_limit() {}

@@ -16,6 +16,11 @@ log = "0.4"
 env_logger = "0.11"
 rayon = "1"
 
+[target.'cfg(unix)'.dependencies]
+# Used only to raise our own open-file-descriptor soft limit at startup (RLIMIT_NOFILE), so the
+# all-files-open k-way merge doesn't hit the default 1024 ulimit on large cohorts.
+libc = "0.2"
+
 [profile.release]
 lto = true
 codegen-units = 1
