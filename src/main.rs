@@ -140,8 +140,9 @@ struct Args {
                 where the sample contributed data, the number of loci where it was a DBSCAN \
                 noise point, and the resulting outlier rate. Sorted by outlier count desc. \
                 Samples flagged at many loci are typically QC issues (low coverage, \
-                contamination) rather than biologically interesting. The QC counts ignore the \
-                `--samples` filter, so controls are included."
+                contamination) rather than biologically interesting. The QC counts span the whole \
+                cohort regardless of `--samples`; an `in_samples` column flags whether each sample \
+                is in the `--samples` list so the table can be filtered to the cases of interest."
     )]
     summary: Option<PathBuf>,
 
@@ -836,7 +837,7 @@ fn main() {
     eprintln!("Done: {} outlier calls", total_outliers);
 
     if let Some(ref path) = args.summary {
-        write_summary(path, &sample_stats);
+        write_summary(path, &sample_stats, &samples_of_interest);
     }
 
     if let Some(ref path) = args.plot {
@@ -844,26 +845,41 @@ fn main() {
     }
 }
 
-fn write_summary(path: &Path, stats: &HashMap<String, (usize, usize)>) {
+fn write_summary(
+    path: &Path,
+    stats: &HashMap<String, (usize, usize)>,
+    samples_of_interest: &Option<HashSet<String>>,
+) {
     let f = std::fs::File::create(path).expect("Cannot create summary file");
     let mut w = BufWriter::new(f);
-    writeln!(w, "sample\tn_loci\tn_outlier\toutlier_rate").unwrap();
-    let mut rows: Vec<(&String, usize, usize, f64)> = stats
+    writeln!(w, "sample\tin_samples\tn_loci\tn_outlier\toutlier_rate").unwrap();
+    // in_samples flags whether the sample is in the --samples list (true for everyone when no
+    // list was given), so the cohort-wide QC table can be filtered down to the cases of interest.
+    let mut rows: Vec<(&String, bool, usize, usize, f64)> = stats
         .iter()
         .map(|(s, (l, o))| {
             let rate = if *l > 0 { *o as f64 / *l as f64 } else { 0.0 };
-            (s, *l, *o, rate)
+            let in_samples = samples_of_interest
+                .as_ref()
+                .map(|set| set.contains(s))
+                .unwrap_or(true);
+            (s, in_samples, *l, *o, rate)
         })
         .collect();
     // Sort by outlier count desc (the QC signal), then rate desc as tiebreaker so a sample
     // flagged 5/10 ranks above one flagged 5/100.
     rows.sort_by(|a, b| {
-        b.2.cmp(&a.2)
-            .then(b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal))
+        b.3.cmp(&a.3)
+            .then(b.4.partial_cmp(&a.4).unwrap_or(std::cmp::Ordering::Equal))
             .then(a.0.cmp(b.0))
     });
-    for (sample, n_loci, n_outlier, rate) in rows {
-        writeln!(w, "{}\t{}\t{}\t{:.4}", sample, n_loci, n_outlier, rate).unwrap();
+    for (sample, in_samples, n_loci, n_outlier, rate) in rows {
+        writeln!(
+            w,
+            "{}\t{}\t{}\t{}\t{:.4}",
+            sample, in_samples, n_loci, n_outlier, rate
+        )
+        .unwrap();
     }
 }
 
