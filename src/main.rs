@@ -107,11 +107,11 @@ struct Args {
     #[arg(
         long = "min-fold-length",
         value_name = "FOLD",
-        help = "Only report outliers whose flagged allele length differs from the locus cluster \
+        help = "Only report length outliers whose flagged allele differs from the locus cluster \
                 mean by at least FOLD-fold in either direction (e.g. 1.5 keeps alleles ≥1.5x \
-                longer, or ≤0.67x shorter, than the cluster mean). Suppresses outliers with only \
-                a modest length change. Combine with --expansions-only to keep large expansions \
-                only. Off by default."
+                longer, or ≤0.67x shorter, than the cluster mean). Suppresses length outliers \
+                with only a modest change; composition (k-mer) outliers are unaffected. Combine \
+                with --expansions-only to keep large expansions only. Off by default."
     )]
     min_fold_length: Option<f64>,
 
@@ -493,9 +493,10 @@ fn main() {
             }
         }
 
-        // --min-fold-length: clear the noise flag for flagged alleles whose length is within
-        // min_fold-fold of the cluster mean length (in either direction), keeping only outliers
-        // with a substantial relative length change. Cluster mean is the raw-bp mean over the
+        // --min-fold-length: clear the noise flag for a flagged allele whose dominant deviation is
+        // on the length axis but whose length is within min_fold-fold of the cluster mean length
+        // (in either direction), keeping only length outliers with a substantial relative change.
+        // Composition (k-mer) outliers are left untouched. Cluster mean is the raw-bp mean over the
         // non-noise alleles (not the normalized length feature).
         if let Some(min_fold) = min_fold_length {
             let (sum, n) = alleles.iter().zip(is_noise.iter()).fold(
@@ -510,8 +511,13 @@ fn main() {
             );
             if n > 0 {
                 let cluster_len_mean = sum as f64 / n as f64;
-                for (noise, allele) in is_noise.iter_mut().zip(alleles.iter()) {
-                    if *noise {
+                for ((noise, allele), point) in
+                    is_noise.iter_mut().zip(alleles.iter()).zip(points.iter())
+                {
+                    if *noise
+                        && per_point_top_axis(point, &cluster_mean, locus_names, length_weight).0
+                            == "length"
+                    {
                         let l = allele.seq.len() as f64;
                         let fold = (l / cluster_len_mean).max(cluster_len_mean / l);
                         if fold < min_fold {
