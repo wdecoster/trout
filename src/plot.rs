@@ -16,7 +16,9 @@ pub struct LocusPlotData {
 
 pub fn render_scatter_plots(data: &[LocusPlotData], path: &Path) {
     if data.is_empty() {
-        eprintln!("No outlier loci to plot");
+        // Still write the output file so workflows (e.g. Snakemake) that declare the
+        // --plot path as an expected output don't fail when there are no outliers.
+        write_placeholder_svg(path);
         return;
     }
 
@@ -200,4 +202,20 @@ pub fn render_scatter_plots(data: &[LocusPlotData], path: &Path) {
     let svg = SvgBackend::new().render_scene(&scene);
     std::fs::write(path, svg).expect("Failed to write plot SVG");
     eprintln!("Wrote scatter plot ({} loci) to {}", n_data, path.display());
+}
+
+/// Write a minimal valid SVG carrying a "no outliers" message. Used when there are no
+/// outlier loci to plot, so the --plot output file still exists for downstream workflows.
+fn write_placeholder_svg(path: &Path) {
+    let svg = r##"<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="480" height="160" viewBox="0 0 480 160">
+  <rect width="480" height="160" fill="white"/>
+  <text x="240" y="80" font-family="sans-serif" font-size="18" fill="#555555" text-anchor="middle" dominant-baseline="middle">No outlier loci detected</text>
+</svg>
+"##;
+    std::fs::write(path, svg).expect("Failed to write placeholder plot SVG");
+    eprintln!(
+        "No outlier loci to plot; wrote placeholder to {}",
+        path.display()
+    );
 }

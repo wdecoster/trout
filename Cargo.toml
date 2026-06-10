@@ -1,6 +1,6 @@
 [package]
 name = "trout"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Tandem Repeat OUTlier identification based on sequence composition and length"
 authors = ["Wouter De Coster <wouter.decoster@gmail.com>"]
