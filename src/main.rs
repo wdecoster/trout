@@ -323,6 +323,54 @@ fn main() {
     let min_locus_samples = args.min_locus_samples;
     let min_length = args.min_length;
     let samples_of_interest: Option<HashSet<String>> = args.samples.as_deref().map(parse_samples);
+
+    // Validate --samples against the cohort. A name-format mismatch (e.g. the file lists bare
+    // sample IDs but the VCFs carry prefixed/suffixed names) silently yields zero outliers, so
+    // report how many matched and stop if any requested sample is absent from the dataset.
+    if let Some(ref wanted) = samples_of_interest {
+        let cohort: HashSet<String> = merger
+            .sample_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut missing: Vec<&str> = Vec::new();
+        for s in wanted {
+            if !cohort.contains(s.as_str()) {
+                missing.push(s.as_str());
+            }
+        }
+        missing.sort_unstable();
+        eprintln!(
+            "--samples: {} requested, {} found in cohort of {} samples",
+            wanted.len(),
+            wanted.len() - missing.len(),
+            cohort.len()
+        );
+        if !missing.is_empty() {
+            let preview: Vec<&str> = missing.iter().take(10).copied().collect();
+            eprintln!(
+                "Error: {} of {} --samples names are not present in the dataset (showing {}): {}{}",
+                missing.len(),
+                wanted.len(),
+                preview.len(),
+                preview.join(", "),
+                if missing.len() > preview.len() {
+                    ", ..."
+                } else {
+                    ""
+                }
+            );
+            let mut examples: Vec<&str> = cohort.iter().map(|s| s.as_str()).collect();
+            examples.sort_unstable();
+            examples.truncate(3);
+            eprintln!(
+                "Cohort sample names look like: {}. Ensure --samples uses the same identifiers.",
+                examples.join(", ")
+            );
+            std::process::exit(1);
+        }
+    }
+
     let has_repeat = repeat_map.is_some();
 
     if has_repeat {

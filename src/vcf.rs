@@ -137,6 +137,12 @@ impl VcfMerger {
         Ok(merger)
     }
 
+    /// Sample names of all successfully opened input VCFs (one per file). This is the set of
+    /// identifiers `--samples` is matched against.
+    pub fn sample_names(&self) -> Vec<Arc<str>> {
+        self.streams.iter().map(|s| Arc::clone(&s.sample)).collect()
+    }
+
     /// Gather up to `batch_size` loci in genome order, draining the merge as it goes. Returns an
     /// empty vec once every file is exhausted. Each entry is `((chrom, pos, end), LocusData)`.
     pub fn next_batch(&mut self, batch_size: usize) -> Vec<LocusEntry> {
