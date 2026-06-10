@@ -12,6 +12,7 @@ mod vcf;
 #[derive(Parser)]
 #[command(
     name = "trout",
+    version,
     about = "Tandem Repeat OUTlier identification based on sequence composition and length",
     long_about = "trout reads STRdust VCF files from a cohort and detects outlier samples \
                   at each repeat locus using multidimensional DBSCAN over repeat length \
