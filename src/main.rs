@@ -910,29 +910,42 @@ fn build_plot_data(
         let mut outlier_pts: Vec<(f64, f64, String)> = Vec::new();
         let mut other_outlier_pts: Vec<(f64, f64, String)> = Vec::new();
 
-        // Jitter amplitudes: a small fraction of each axis's spread. x-jitter does most of the
+        // Jitter amplitudes (a small fraction of each axis's spread) plus a tally of how many
+        // points share each exact (length, feature-value) coordinate. Only points that collide
+        // with another are jittered, so unique points — including a lone outlier — keep their true
+        // position and --jitter is a no-op on plots with no overlap. x-jitter does most of the
         // de-overlapping (samples sharing a length fan out horizontally); y-jitter spreads a
         // same-composition row vertically.
-        let (jx_amp, jy_amp) = if jitter {
-            let (mut y_lo, mut y_hi) = (f64::INFINITY, f64::NEG_INFINITY);
-            for (_, _, p, _) in &pts {
-                y_lo = y_lo.min(p[y_feat_idx]);
-                y_hi = y_hi.max(p[y_feat_idx]);
+        let (jx_amp, jy_amp, collisions) = if jitter {
+            let mut y_lo = f64::INFINITY;
+            let mut y_hi = f64::NEG_INFINITY;
+            let mut counts: HashMap<(usize, u64), usize> = HashMap::new();
+            for (_, raw_len, p, _) in &pts {
+                let y = p[y_feat_idx];
+                y_lo = y_lo.min(y);
+                y_hi = y_hi.max(y);
+                *counts.entry((*raw_len, y.to_bits())).or_insert(0) += 1;
             }
-            ((x_max - x_min) * 0.015, (y_hi - y_lo) * 0.04)
+            ((x_max - x_min) * 0.015, (y_hi - y_lo) * 0.04, counts)
         } else {
-            (0.0, 0.0)
+            (0.0, 0.0, HashMap::new())
         };
 
         for ((sample, raw_len, point, is_out), top_ax) in pts.iter().zip(outlier_top_axes.iter()) {
-            let (ox, oy) = if jitter {
+            let y_raw = point[y_feat_idx];
+            let overlapped = collisions
+                .get(&(*raw_len, y_raw.to_bits()))
+                .copied()
+                .unwrap_or(0)
+                > 1;
+            let (ox, oy) = if jitter && overlapped {
                 let (a, b) = jitter_offsets(sample, *raw_len);
                 (a * jx_amp, b * jy_amp)
             } else {
                 (0.0, 0.0)
             };
             let x = *raw_len as f64 + ox;
-            let y_val = point[y_feat_idx] + oy;
+            let y_val = y_raw + oy;
             if *is_out && top_ax.as_deref() == Some(axis_name.as_str()) {
                 // Listed outlier for this axis → red
                 outlier_pts.push((x, y_val, sample.to_string()));
