@@ -100,9 +100,35 @@ impl VcfMerger {
                         )
                         .into());
                     }
-                    eprintln!("Warning: failed to open {}: {}", path.display(), e);
+                    // A malformed VCF carries a self-contained message; anything else is an I/O
+                    // failure that needs the path for context. Either way, fail fast.
+                    if e.kind() == std::io::ErrorKind::InvalidData {
+                        return Err(e.to_string().into());
+                    }
+                    return Err(format!("failed to open VCF {}: {}", path.display(), e).into());
                 }
             }
+        }
+
+        // Reject duplicate sample names: two VCFs carrying the same identifier would be silently
+        // merged into one sample's alleles at every locus, corrupting the cohort.
+        let mut seen: HashMap<&str, usize> = HashMap::new();
+        for s in &streams {
+            *seen.entry(s.sample.as_ref()).or_insert(0) += 1;
+        }
+        let mut dups: Vec<&str> = seen
+            .iter()
+            .filter(|&(_, &n)| n > 1)
+            .map(|(&name, _)| name)
+            .collect();
+        if !dups.is_empty() {
+            dups.sort_unstable();
+            return Err(format!(
+                "duplicate sample name(s) across input VCFs: {}. Each VCF must have a unique \
+                 sample identifier (the last column of its #CHROM line).",
+                dups.join(", ")
+            )
+            .into());
         }
 
         let mut merger = VcfMerger {
@@ -128,8 +154,7 @@ impl VcfMerger {
                     s.head = head;
                 }
                 Err(e) => {
-                    eprintln!("Warning: error reading {}: {}", s.sample, e);
-                    s.head = None;
+                    return Err(format!("error reading VCF for sample {}: {}", s.sample, e).into());
                 }
             }
         }
@@ -145,7 +170,10 @@ impl VcfMerger {
 
     /// Gather up to `batch_size` loci in genome order, draining the merge as it goes. Returns an
     /// empty vec once every file is exhausted. Each entry is `((chrom, pos, end), LocusData)`.
-    pub fn next_batch(&mut self, batch_size: usize) -> Vec<LocusEntry> {
+    pub fn next_batch(
+        &mut self,
+        batch_size: usize,
+    ) -> Result<Vec<LocusEntry>, Box<dyn std::error::Error>> {
         let VcfMerger {
             streams,
             contig_rank,
@@ -197,8 +225,11 @@ impl VcfMerger {
                             s.head = head;
                         }
                         Err(e) => {
-                            eprintln!("Warning: error reading {}: {}", s.sample, e);
-                            s.head = None;
+                            return Err(format!(
+                                "error reading VCF for sample {}: {}",
+                                s.sample, e
+                            )
+                            .into());
                         }
                     }
                 }
@@ -213,7 +244,7 @@ impl VcfMerger {
             ));
         }
 
-        out
+        Ok(out)
     }
 }
 
@@ -258,13 +289,19 @@ fn open_stream(
     next_rank: &mut u32,
 ) -> Result<Stream, std::io::Error> {
     let mut reader = reader(path)?;
-    let mut sample: Arc<str> = Arc::from("unknown");
     let mut line = String::new();
+
+    let malformed = |msg: &str| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("malformed VCF {}: {}", path.display(), msg),
+        )
+    };
 
     loop {
         line.clear();
         if reader.read_line(&mut line)? == 0 {
-            break; // empty / header-only file
+            return Err(malformed("reached end of file before a #CHROM header line"));
         }
         if line.starts_with("##") {
             if let Some(id) = parse_contig_id(&line) {
@@ -277,20 +314,27 @@ fn open_stream(
             continue;
         }
         if line.starts_with('#') {
-            // #CHROM ... FORMAT <SAMPLE>: the sample name is the last column.
-            let name = line.trim_end().rsplit('\t').next().unwrap_or("unknown");
-            sample = Arc::from(name);
-            break; // header done; reader now at the first data line
+            // #CHROM POS ID REF ALT QUAL FILTER INFO FORMAT <SAMPLE...>: a genotyped VCF has at
+            // least 10 tab-columns. trout expects one sample per file: take the last column.
+            let cols: Vec<&str> = line.trim_end().split('\t').collect();
+            if cols.len() < 10 {
+                return Err(malformed(
+                    "#CHROM line has no sample column (need at least 10 tab-separated fields)",
+                ));
+            }
+            let name = cols[cols.len() - 1];
+            if name.is_empty() {
+                return Err(malformed("empty sample name in the #CHROM line"));
+            }
+            return Ok(Stream {
+                reader,
+                sample: Arc::from(name),
+                head: None,
+            });
         }
-        // A data line with no #CHROM header is malformed VCF; stop scanning.
-        break;
+        // A data line before any #CHROM header is malformed VCF.
+        return Err(malformed("data line before the #CHROM header"));
     }
-
-    Ok(Stream {
-        reader,
-        sample,
-        head: None,
-    })
 }
 
 /// Read forward until the next valid data record (skipping genotype-missing and all-filtered

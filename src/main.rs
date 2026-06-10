@@ -383,12 +383,18 @@ fn main() {
     // all embarrassingly parallel. The merger yields loci already in genome order, so we process
     // them in bounded batches: rayon parallelises within a batch (and preserves order), while the
     // batch boundary caps peak memory at one batch of alleles instead of the whole cohort.
+    // Count loci dropped for having too few samples, so a too-high --min-locus-samples or a
+    // cohort with no shared loci (e.g. disjoint coordinates) surfaces as a number rather than a
+    // silent zero-outlier result.
+    let skipped_low_sample = std::sync::atomic::AtomicUsize::new(0);
+
     let process_locus = |((chrom, pos, end), locus_data): vcf::LocusEntry| -> Option<LocusResult> {
         let chrom = String::from(chrom);
         let vcf::LocusData { ref_seq, alleles } = locus_data;
 
         let unique_samples: HashSet<&str> = alleles.iter().map(|a| a.sample.as_ref()).collect();
         if unique_samples.len() < min_locus_samples {
+            skipped_low_sample.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return None;
         }
 
@@ -611,7 +617,13 @@ fn main() {
     // all cores busy, small enough that one batch of alleles is cheap to hold.
     const BATCH_SIZE: usize = 4096;
     loop {
-        let batch = merger.next_batch(BATCH_SIZE);
+        let batch = match merger.next_batch(BATCH_SIZE) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        };
         if batch.is_empty() {
             break;
         }
@@ -720,6 +732,13 @@ fn main() {
         );
     }
     eprintln!("Processed {} loci", n_loci);
+    let skipped = skipped_low_sample.load(std::sync::atomic::Ordering::Relaxed);
+    if skipped > 0 {
+        eprintln!(
+            "Skipped {} loci with fewer than {} samples (--min-locus-samples)",
+            skipped, min_locus_samples
+        );
+    }
 
     if matches!(k_spec, KSpec::Auto) {
         let parts: Vec<String> = k_histogram
