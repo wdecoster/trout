@@ -210,6 +210,7 @@ impl VcfMerger {
                     .is_some_and(|h| h.pos == mpos && h.end == mend && h.chrom == mchrom)
                 {
                     let rec = s.head.take().unwrap();
+                    let (prev_rank, prev_pos, prev_end) = (rec.rank, rec.pos, rec.end);
                     if ref_seq.is_none() {
                         ref_seq = Some(rec.ref_seq);
                     }
@@ -222,6 +223,21 @@ impl VcfMerger {
                     match next_record(&mut s.reader, *min_support, contig_rank, next_rank) {
                         Ok((head, dropped)) => {
                             *n_dropped += dropped;
+                            // Inputs must be coordinate-sorted. An unsorted stream silently
+                            // fragments loci in the merge (the same locus emitted more than once,
+                            // each time with a different subset of samples), so a record stepping
+                            // backwards from the previous one is a hard error.
+                            if let Some(ref h) = head
+                                && (h.rank, h.pos, h.end) < (prev_rank, prev_pos, prev_end)
+                            {
+                                return Err(format!(
+                                    "VCF for sample {} is not coordinate-sorted: record {}:{} \
+                                     precedes {}:{}. Sort each input VCF (e.g. `bcftools sort`) \
+                                     before running trout.",
+                                    s.sample, h.chrom, h.pos, rec.chrom, prev_pos
+                                )
+                                .into());
+                            }
                             s.head = head;
                         }
                         Err(e) => {
