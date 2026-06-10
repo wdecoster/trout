@@ -105,6 +105,24 @@ struct Args {
     min_length: Option<usize>,
 
     #[arg(
+        long = "expansions-only",
+        help = "Only report length outliers that are longer than the cohort (expansions). \
+                A flagged allele whose dominant deviation is on the length axis but which is \
+                shorter than the cluster (a contraction) is suppressed. Composition (k-mer) \
+                outliers and length expansions are unaffected. Off by default."
+    )]
+    expansions_only: bool,
+
+    #[arg(
+        long = "jitter",
+        help = "Add a small deterministic jitter to scatter-plot points so samples sharing the \
+                same length and composition (which otherwise stack into a single marker) fan out \
+                into a visible cloud. Purely cosmetic — does not affect outlier calling. Off by \
+                default."
+    )]
+    jitter: bool,
+
+    #[arg(
         long = "summary",
         value_name = "FILE",
         help = "Write a per-sample QC TSV to FILE: one row per sample with the number of loci \
@@ -322,6 +340,8 @@ fn main() {
     let min_axis_dev = args.min_axis_dev;
     let min_locus_samples = args.min_locus_samples;
     let min_length = args.min_length;
+    let expansions_only = args.expansions_only;
+    let jitter = args.jitter;
     let samples_of_interest: Option<HashSet<String>> = args.samples.as_deref().map(parse_samples);
 
     // Validate --samples against the cohort. A name-format mismatch (e.g. the file lists bare
@@ -444,6 +464,23 @@ fn main() {
         }
 
         let cluster_mean = cluster_mean(&points, &is_noise);
+
+        // --expansions-only: a length outlier shorter than the cohort cluster is a contraction,
+        // not an expansion. Clear the noise flag for flagged alleles whose dominant deviation is
+        // on the length axis and whose length is below the cluster mean, so they drop out of
+        // calls, counts, and plots alike. Composition (k-mer) outliers are unaffected.
+        if expansions_only {
+            for (noise, point) in is_noise.iter_mut().zip(points.iter()) {
+                if *noise
+                    && point[0] < cluster_mean[0]
+                    && per_point_top_axis(point, &cluster_mean, locus_names, length_weight).0
+                        == "length"
+                {
+                    *noise = false;
+                }
+            }
+        }
+
         let locus_top_axes = top_axes(
             &points,
             &is_noise,
@@ -573,6 +610,7 @@ fn main() {
                 length_weight,
                 min_axis_dev,
                 &samples_of_interest,
+                jitter,
             )
         } else {
             Vec::new()
@@ -793,6 +831,7 @@ fn build_plot_data(
     length_weight: f64,
     min_axis_dev: Option<f64>,
     samples_of_interest: &Option<HashSet<String>>,
+    jitter: bool,
 ) -> Vec<plot::LocusPlotData> {
     let mut pts: Vec<(&str, usize, &Vec<f64>, bool)> = alleles
         .iter()
@@ -831,6 +870,18 @@ fn build_plot_data(
         })
         .collect();
 
+    // Distinct samples contributing alleles at this locus, shown in each plot title so heavy
+    // marker overlap (many samples on the same coordinate) isn't mistaken for missing data.
+    let n_samples = alleles
+        .iter()
+        .map(|a| a.sample.as_ref())
+        .collect::<HashSet<&str>>()
+        .len();
+
+    // Length-axis (x) span, used to scale jitter. Computed once since x is the same for every plot.
+    let x_min = pts.iter().map(|(_, l, _, _)| *l).min().unwrap_or(0) as f64;
+    let x_max = pts.iter().map(|(_, l, _, _)| *l).max().unwrap_or(0) as f64;
+
     let mut plot_data: Vec<plot::LocusPlotData> = Vec::new();
 
     for axis_name in &unique_axes {
@@ -853,23 +904,44 @@ fn build_plot_data(
             names.iter().position(|n| n == axis_name).unwrap_or(1)
         };
         let y_label = names[y_feat_idx].clone();
-        let title = format!("{} [{}]", title_prefix, axis_name);
+        let title = format!("{} [{}] (n={})", title_prefix, axis_name, n_samples);
 
         let mut normal: Vec<(f64, f64, String)> = Vec::new();
         let mut outlier_pts: Vec<(f64, f64, String)> = Vec::new();
         let mut other_outlier_pts: Vec<(f64, f64, String)> = Vec::new();
 
+        // Jitter amplitudes: a small fraction of each axis's spread. x-jitter does most of the
+        // de-overlapping (samples sharing a length fan out horizontally); y-jitter spreads a
+        // same-composition row vertically.
+        let (jx_amp, jy_amp) = if jitter {
+            let (mut y_lo, mut y_hi) = (f64::INFINITY, f64::NEG_INFINITY);
+            for (_, _, p, _) in &pts {
+                y_lo = y_lo.min(p[y_feat_idx]);
+                y_hi = y_hi.max(p[y_feat_idx]);
+            }
+            ((x_max - x_min) * 0.015, (y_hi - y_lo) * 0.04)
+        } else {
+            (0.0, 0.0)
+        };
+
         for ((sample, raw_len, point, is_out), top_ax) in pts.iter().zip(outlier_top_axes.iter()) {
-            let y_val = point[y_feat_idx];
+            let (ox, oy) = if jitter {
+                let (a, b) = jitter_offsets(sample, *raw_len);
+                (a * jx_amp, b * jy_amp)
+            } else {
+                (0.0, 0.0)
+            };
+            let x = *raw_len as f64 + ox;
+            let y_val = point[y_feat_idx] + oy;
             if *is_out && top_ax.as_deref() == Some(axis_name.as_str()) {
                 // Listed outlier for this axis → red
-                outlier_pts.push((*raw_len as f64, y_val, sample.to_string()));
+                outlier_pts.push((x, y_val, sample.to_string()));
             } else if *is_out && top_ax.is_some() {
                 // Listed outlier attributed to a different axis → orange (companion plot exists)
-                other_outlier_pts.push((*raw_len as f64, y_val, sample.to_string()));
+                other_outlier_pts.push((x, y_val, sample.to_string()));
             } else {
                 // Normal allele, control outlier, or unattributed outlier → blue
-                normal.push((*raw_len as f64, y_val, sample.to_string()));
+                normal.push((x, y_val, sample.to_string()));
             }
         }
 
@@ -883,6 +955,19 @@ fn build_plot_data(
     }
 
     plot_data
+}
+
+/// Deterministic per-point jitter, each component in [-1, 1], seeded by sample name and allele
+/// length so a given point always lands in the same place across runs (reproducible plots).
+fn jitter_offsets(sample: &str, raw_len: usize) -> (f64, f64) {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    sample.hash(&mut h);
+    raw_len.hash(&mut h);
+    let v = h.finish();
+    let a = (v & 0xffff_ffff) as f64 / u32::MAX as f64 * 2.0 - 1.0;
+    let b = ((v >> 32) & 0xffff_ffff) as f64 / u32::MAX as f64 * 2.0 - 1.0;
+    (a, b)
 }
 
 /// Mean feature vector of non-outlier alleles (the "cluster centre").
