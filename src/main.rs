@@ -107,20 +107,23 @@ struct Args {
     #[arg(
         long = "min-fold-length",
         value_name = "FOLD",
-        help = "Only report length outliers whose flagged allele differs from the locus cluster \
-                mean by at least FOLD-fold in either direction (e.g. 1.5 keeps alleles ≥1.5x \
-                longer, or ≤0.67x shorter, than the cluster mean). Suppresses length outliers \
-                with only a modest change; composition (k-mer) outliers are unaffected. Combine \
-                with --expansions-only to keep large expansions only. Off by default."
+        help = "Only report length outliers whose flagged allele differs from the longest-allele \
+                cluster's mean length by at least FOLD-fold in either direction (e.g. 1.5 keeps \
+                alleles ≥1.5x longer, or ≤0.67x shorter, than that reference). On multi-modal loci \
+                the reference is the cluster with the longest alleles, not a pooled mean between \
+                modes. Suppresses length outliers with only a modest change; composition (k-mer) \
+                outliers are unaffected. Combine with --expansions-only to keep large expansions \
+                only. Off by default."
     )]
     min_fold_length: Option<f64>,
 
     #[arg(
         long = "expansions-only",
-        help = "Only report length outliers that are longer than the cohort (expansions). \
-                A flagged allele whose dominant deviation is on the length axis but which is \
-                shorter than the cluster (a contraction) is suppressed. Composition (k-mer) \
-                outliers and length expansions are unaffected. Off by default."
+        help = "Only report length outliers that are longer than the longest-allele cluster \
+                (expansions). A flagged allele whose dominant deviation is on the length axis but \
+                which is shorter than that reference cluster (a contraction) is suppressed. On \
+                multi-modal loci the reference is the cluster with the longest alleles. \
+                Composition (k-mer) outliers and length expansions are unaffected. Off by default."
     )]
     expansions_only: bool,
 
@@ -150,7 +153,7 @@ struct Args {
         long = "min-support",
         value_name = "N",
         help = "Drop alleles whose STRdust SUP (read support) is below N. Off by default — set \
-                to suppress outlier calls driven by low-support assemblies. SUP is per-allele \
+                to suppress outlier calls driven by low-support variant calls. SUP is per-allele \
                 in the VCF FORMAT (one value per called GT allele); alleles whose SUP is \
                 missing or unparseable are treated as 0 support and dropped."
     )]
@@ -465,7 +468,27 @@ fn main() {
             })
             .collect();
 
-        let mut is_noise = outlier::find_outliers(&points, eps, min_samples);
+        let cluster_labels = outlier::find_clusters(&points, eps, min_samples);
+        let mut is_noise: Vec<bool> = cluster_labels.iter().map(|&l| l < 0).collect();
+
+        // Reference length for --expansions-only / --min-fold-length: the mean allele length of
+        // the DBSCAN cluster whose alleles are longest (by cluster mean length). On a unimodal
+        // locus this is just the single cluster; on a multi-modal locus it avoids comparing
+        // against a pooled mean that sits between the modes. None if there are no clusters.
+        let ref_len_mean: Option<f64> = {
+            let mut per_cluster: HashMap<i32, (usize, usize)> = HashMap::new();
+            for (&label, allele) in cluster_labels.iter().zip(alleles.iter()) {
+                if label >= 0 {
+                    let entry = per_cluster.entry(label).or_insert((0, 0));
+                    entry.0 += allele.seq.len();
+                    entry.1 += 1;
+                }
+            }
+            per_cluster
+                .values()
+                .map(|(sum, n)| *sum as f64 / *n as f64)
+                .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        };
 
         // --min-length: clear the noise flag for alleles shorter than the cutoff.
         if let Some(min_len) = min_length {
@@ -478,14 +501,16 @@ fn main() {
 
         let cluster_mean = cluster_mean(&points, &is_noise);
 
-        // --expansions-only: a length outlier shorter than the cohort cluster is a contraction,
-        // not an expansion. Clear the noise flag for flagged alleles whose dominant deviation is
-        // on the length axis and whose length is below the cluster mean, so they drop out of
-        // calls, counts, and plots alike. Composition (k-mer) outliers are unaffected.
-        if expansions_only {
-            for (noise, point) in is_noise.iter_mut().zip(points.iter()) {
+        // --expansions-only: a length outlier shorter than the longest-allele cluster is a
+        // contraction, not an expansion. Clear the noise flag for flagged alleles whose dominant
+        // deviation is on the length axis and whose length is below that reference, so they drop
+        // out of calls, counts, and plots alike. Composition (k-mer) outliers are unaffected.
+        if expansions_only && let Some(ref_len) = ref_len_mean {
+            for ((noise, allele), point) in
+                is_noise.iter_mut().zip(alleles.iter()).zip(points.iter())
+            {
                 if *noise
-                    && point[0] < cluster_mean[0]
+                    && (allele.seq.len() as f64) < ref_len
                     && per_point_top_axis(point, &cluster_mean, locus_names, length_weight).0
                         == "length"
                 {
@@ -495,35 +520,23 @@ fn main() {
         }
 
         // --min-fold-length: clear the noise flag for a flagged allele whose dominant deviation is
-        // on the length axis but whose length is within min_fold-fold of the cluster mean length
-        // (in either direction), keeping only length outliers with a substantial relative change.
-        // Composition (k-mer) outliers are left untouched. Cluster mean is the raw-bp mean over the
-        // non-noise alleles (not the normalized length feature).
-        if let Some(min_fold) = min_fold_length {
-            let (sum, n) = alleles.iter().zip(is_noise.iter()).fold(
-                (0usize, 0usize),
-                |(sum, n), (a, &noise)| {
-                    if noise {
-                        (sum, n)
-                    } else {
-                        (sum + a.seq.len(), n + 1)
-                    }
-                },
-            );
-            if n > 0 {
-                let cluster_len_mean = sum as f64 / n as f64;
-                for ((noise, allele), point) in
-                    is_noise.iter_mut().zip(alleles.iter()).zip(points.iter())
+        // on the length axis but whose length is within min_fold-fold (either direction) of the
+        // longest-allele cluster's mean length, keeping only length outliers with a substantial
+        // relative change. Composition (k-mer) outliers are left untouched.
+        if let Some(min_fold) = min_fold_length
+            && let Some(ref_len) = ref_len_mean
+        {
+            for ((noise, allele), point) in
+                is_noise.iter_mut().zip(alleles.iter()).zip(points.iter())
+            {
+                if *noise
+                    && per_point_top_axis(point, &cluster_mean, locus_names, length_weight).0
+                        == "length"
                 {
-                    if *noise
-                        && per_point_top_axis(point, &cluster_mean, locus_names, length_weight).0
-                            == "length"
-                    {
-                        let l = allele.seq.len() as f64;
-                        let fold = (l / cluster_len_mean).max(cluster_len_mean / l);
-                        if fold < min_fold {
-                            *noise = false;
-                        }
+                    let l = allele.seq.len() as f64;
+                    let fold = (l / ref_len).max(ref_len / l);
+                    if fold < min_fold {
+                        *noise = false;
                     }
                 }
             }

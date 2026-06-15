@@ -93,7 +93,7 @@ Only report outliers where the flagged allele is at least N bp long. Useful to s
 
 ### `--min-support N`
 
-Drop alleles whose STRdust `SUP` (read support) field is below `N` before any clustering. Off by default. Useful for suppressing outlier calls driven by low-coverage assemblies that produced an unusual sequence by accident. `SUP` is read per-allele from the VCF FORMAT (one comma-separated value per called GT allele). Alleles whose `SUP` is missing or unparseable are treated as zero support and dropped — if you set this and your VCFs lack `SUP`, all alleles will be dropped and trout will warn loudly via the "Dropped N alleles" line printed to stderr.
+Drop alleles whose STRdust `SUP` (read support) field is below `N` before any clustering. Off by default. Useful for suppressing outlier calls driven by low-support variant calls. `SUP` is read per-allele from the VCF FORMAT (one comma-separated value per called GT allele). Alleles whose `SUP` is missing or unparseable are treated as zero support and dropped — if you set this and your VCFs lack `SUP`, all alleles will be dropped and trout will warn loudly via the "Dropped N alleles" line printed to stderr.
 
 ### `--summary FILE`
 

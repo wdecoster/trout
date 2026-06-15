@@ -7,9 +7,23 @@ use dbscan::{Classification, Model};
 /// reference oracle; the comparison tests below assert that the two agree on noise/non-noise
 /// classification (the cluster IDs themselves can legitimately differ between implementations
 /// because of border-point assignment ambiguity).
+#[cfg(test)]
 pub fn find_outliers(points: &[Vec<f64>], eps: f64, min_samples: usize) -> Vec<bool> {
+    find_clusters(points, eps, min_samples)
+        .iter()
+        .map(|&label| label < 0)
+        .collect()
+}
+
+/// DBSCAN cluster labels, one per point: `-1` = noise (outlier), `>= 0` = cluster id. Same
+/// clustering as [`find_outliers`], but keeps the cluster identity so callers can, e.g., pick the
+/// cluster with the longest alleles as a reference. Cheap: the cluster expansion already walks
+/// each connected component, so retaining its id costs nothing extra.
+pub fn find_clusters(points: &[Vec<f64>], eps: f64, min_samples: usize) -> Vec<i32> {
     if points.len() < min_samples {
-        return vec![false; points.len()];
+        // Too few points to form a cluster; match find_outliers' "nobody is an outlier" by
+        // placing everyone in one trivial cluster.
+        return vec![0; points.len()];
     }
     find_outliers_matrix(points, eps, min_samples)
 }
@@ -18,7 +32,7 @@ pub fn find_outliers(points: &[Vec<f64>], eps: f64, min_samples: usize) -> Vec<b
 /// standard cluster expansion against it. Wins over the brute-force `dbscan` crate by:
 ///   (a) computing each pairwise distance exactly once instead of once per range query, and
 ///   (b) avoiding per-range-query Vec allocations (the flamegraph showed those dominated).
-fn find_outliers_matrix(points: &[Vec<f64>], eps: f64, min_samples: usize) -> Vec<bool> {
+fn find_outliers_matrix(points: &[Vec<f64>], eps: f64, min_samples: usize) -> Vec<i32> {
     let n = points.len();
     if n == 0 {
         return Vec::new();
@@ -91,6 +105,10 @@ fn find_outliers_matrix(points: &[Vec<f64>], eps: f64, min_samples: usize) -> Ve
         Clustered,
     }
     let mut status = vec![St::Unvisited; n];
+    // Cluster id per point; -1 = noise/unassigned. Filled alongside `status` as the BFS walks
+    // each connected component, so callers can identify individual clusters.
+    let mut labels = vec![-1i32; n];
+    let mut cluster_id = 0i32;
     let mut queue: Vec<usize> = Vec::new();
 
     for p in 0..n {
@@ -105,11 +123,13 @@ fn find_outliers_matrix(points: &[Vec<f64>], eps: f64, min_samples: usize) -> Ve
         // its neighbours. We mark a point Clustered *when we enqueue it*, not when we pop,
         // so duplicate enqueues are impossible without a separate "in-queue" mask.
         status[p] = St::Clustered;
+        labels[p] = cluster_id;
         queue.clear();
         for &q in neighbours_of(p) {
             let q = q as usize;
             if q != p && (status[q] == St::Unvisited || status[q] == St::Noise) {
                 status[q] = St::Clustered;
+                labels[q] = cluster_id;
                 queue.push(q);
             }
         }
@@ -125,14 +145,16 @@ fn find_outliers_matrix(points: &[Vec<f64>], eps: f64, min_samples: usize) -> Ve
                     let r = r as usize;
                     if status[r] == St::Unvisited || status[r] == St::Noise {
                         status[r] = St::Clustered;
+                        labels[r] = cluster_id;
                         queue.push(r);
                     }
                 }
             }
         }
+        cluster_id += 1;
     }
 
-    status.iter().map(|&s| s == St::Noise).collect()
+    labels
 }
 
 /// Reference implementation using the `dbscan` crate. Kept for comparison tests and for any
@@ -156,7 +178,11 @@ mod tests {
     use super::*;
 
     fn assert_same(points: &[Vec<f64>], eps: f64, ms: usize) {
-        let custom = find_outliers_matrix(points, eps, ms);
+        // find_outliers_matrix now returns cluster labels; compare noise classification (label < 0).
+        let custom: Vec<bool> = find_outliers_matrix(points, eps, ms)
+            .iter()
+            .map(|&label| label < 0)
+            .collect();
         let crate_v = find_outliers_crate(points, eps, ms);
         assert_eq!(
             custom, crate_v,
