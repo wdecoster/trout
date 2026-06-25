@@ -1455,8 +1455,6 @@ mod tests {
 
     #[test]
     fn modified_z_all_identical_is_zero() {
-        assert!(modified_zscores(&[0.1, 0.1, 0.1])
-            .iter()
-            .all(|v| *v == 0.0));
+        assert!(modified_zscores(&[0.1, 0.1, 0.1]).iter().all(|v| *v == 0.0));
     }
 }

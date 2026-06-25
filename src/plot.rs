@@ -92,8 +92,10 @@ pub fn render_scatter_plots(data: &[LocusPlotData], path: &Path, jitter: bool, i
                     let counted = dedup_with_counts(&locus.normal);
                     let max_c = counted.iter().map(|(_, _, c)| *c).max().unwrap_or(1);
                     let xy: Vec<(f64, f64)> = counted.iter().map(|(x, y, _)| (*x, *y)).collect();
-                    let colors: Vec<String> =
-                        counted.iter().map(|(_, _, c)| count_color(*c, max_c)).collect();
+                    let colors: Vec<String> = counted
+                        .iter()
+                        .map(|(_, _, c)| count_color(*c, max_c))
+                        .collect();
                     ScatterPlot::new()
                         .with_data(xy)
                         .with_colors(colors)
