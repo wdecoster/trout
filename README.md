@@ -1,11 +1,28 @@
 # trout
+
+[![test](https://github.com/wdecoster/trout/actions/workflows/test.yml/badge.svg)](https://github.com/wdecoster/trout/actions/workflows/test.yml)
+
 Tool to identify Tandem Repeat OUTliers based on sequence composition and length
 
 ## What it does
 
 trout takes a cohort of per-sample VCF files produced by [STRdust](https://github.com/wdecoster/STRdust) and identifies samples that are outliers at any repeat locus — either because their alleles are unusually long, have an unusual sequence composition, or both.
 
-Detection uses multidimensional DBSCAN. Each allele in each sample is represented as a feature vector combining its normalised length and k-mer frequency profile. Samples whose alleles fall outside all clusters (DBSCAN noise points) are reported as outliers.
+Detection uses multidimensional DBSCAN. Each allele in each sample is represented as a feature vector combining its normalised length and k-mer frequency profile. Samples whose alleles fall outside all clusters (DBSCAN noise points) are reported as outliers. For the details of the feature representation and clustering, see [docs/internals.md](docs/internals.md).
+
+## Installation
+
+Download a prebuilt binary for your platform from the
+[releases page](https://github.com/wdecoster/trout/releases) (Linux,
+static Linux/musl, and macOS), make it executable, and put it on your `PATH`.
+
+Or build from source with a [Rust toolchain](https://rustup.rs/) (1.85 or newer,
+for the 2024 edition):
+
+```bash
+cargo install --path .
+# or: cargo build --release  → target/release/trout
+```
 
 ## Usage
 
@@ -40,7 +57,7 @@ Rows are grouped by locus and within a locus sorted by `deviation` descending, s
 
 K-mer length for the sequence composition features. For k=2 there are 16 possible dimers (AA, AC, …, TT); for k=3 there are 64 trimers. Larger k captures more detailed composition information but increases the dimensionality of the DBSCAN feature space, which may require tuning `--eps`. k=2 is a good default for most repeat types.
 
-Pass `-k auto` to let trout pick k per locus from the data. For each locus it runs a self-shift periodicity check on the REF allele and on the median-length allele in the cohort and accepts the period (in 2..=6) when they agree. REF is short but accurate; the median-length allele is longer but may carry motif-sequence variation — requiring agreement guards against picking a spurious period from either alone. When one signal is missing (REF too short, or median is too irregular) the available one is used; when both detect periods but disagree, or when neither has a clean signal (typically loci whose motif is longer than 6 bp), k falls back to 3 (the most common pathogenic motif length, with 24 canonical features vs only 10 at k=2). A summary histogram of the detected k values is printed to stderr at the end of the run. An explicit `k` column in `--repeat` always overrides auto detection for that locus.
+Pass `-k auto` to let trout pick k per locus from the data, detecting the motif period (2–6 bp) from the repeat sequence itself. Loci with no clean signal (typically a motif longer than 6 bp) fall back to k=3, the most common pathogenic motif length. A histogram of the detected k values is printed to stderr at the end of the run, and an explicit `k` column in `--repeat` always overrides auto detection for that locus. See [docs/internals.md](docs/internals.md#per-locus-k-detection--k-auto) for how the period is detected (REF/median agreement and the base-composition correction).
 
 ### `--eps` (default: 0.2)
 
@@ -161,3 +178,9 @@ trout cohort/*.vcf.gz \
 # More sensitive (smaller eps, higher length weight)
 trout cohort/*.vcf.gz --eps 0.15 --length-weight 2 > outliers_sensitive.tsv
 ```
+
+## Further reading
+
+Implementation details — the feature representation, the DBSCAN clustering and
+its parameters, per-locus k detection (`-k auto`), and the length-weight
+rationale — are documented in [docs/internals.md](docs/internals.md).
