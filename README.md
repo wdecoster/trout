@@ -179,6 +179,15 @@ trout cohort/*.vcf.gz \
 trout cohort/*.vcf.gz --eps 0.15 --length-weight 2 > outliers_sensitive.tsv
 ```
 
+## How this was built
+
+In the interest of transparency: trout was not written by hand. The code was
+written and tested by [Claude](https://claude.com/claude-code), Anthropic's
+coding agent, working under the supervision of
+[Wouter De Coster](https://github.com/wdecoster) — who directed the design,
+decided what the tool should do and which features to add, and reviewed the
+result.
+
 ## Further reading
 
 Implementation details — the feature representation, the DBSCAN clustering and
