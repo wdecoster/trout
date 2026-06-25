@@ -78,8 +78,11 @@ struct Args {
     #[arg(
         long = "plot",
         value_name = "FILE",
-        help = "Write an interactive SVG scatter plot (length vs. top composition axis) \
-                for each outlier locus to FILE. Hover over points to see sample names."
+        help = "Write an SVG scatter plot (length vs. top composition axis) for each outlier locus \
+                to FILE. Outlier sample names are labelled with arrows and are hoverable; the \
+                normal cloud is collapsed (one shaded marker per position) to keep the file small \
+                and scrollable. Use --interactive for full per-point hover/search at the cost of \
+                file size."
     )]
     plot: Option<PathBuf>,
 
@@ -137,15 +140,29 @@ struct Args {
     jitter: bool,
 
     #[arg(
+        long = "interactive",
+        help = "Make the --plot SVG fully interactive: hover any point (normal or outlier) for its \
+                sample name and a search box to filter. This restores per-point detail at the cost \
+                of a much larger, heavier file — one DOM node per sample per locus — so it is only \
+                practical for small cohorts or few loci. The default plot is non-interactive and \
+                scalable: the normal cloud is collapsed to one marker per position (shaded by how \
+                many samples it holds) and only outliers keep a hover label. Off by default."
+    )]
+    interactive: bool,
+
+    #[arg(
         long = "summary",
         value_name = "FILE",
         help = "Write a per-sample QC TSV to FILE: one row per sample with the number of loci \
-                where the sample contributed data, the number of loci where it was a DBSCAN \
-                noise point, and the resulting outlier rate. Sorted by outlier count desc. \
-                Samples flagged at many loci are typically QC issues (low coverage, \
-                contamination) rather than biologically interesting. The QC counts span the whole \
-                cohort regardless of `--samples`; an `in_samples` column flags whether each sample \
-                is in the `--samples` list so the table can be filtered to the cases of interest."
+                where the sample contributed data (n_loci), the number of loci where it was a \
+                DBSCAN noise point (n_outlier), the resulting outlier_rate, and a mod_zscore. \
+                The mod_zscore is a robust (median/MAD) z-score of the outlier_rate across the \
+                cohort, so you can tell whether a count is unusual rather than normal variation: \
+                by convention |mod_zscore| > 3.5 flags an anomalously high rate (usually a QC \
+                issue: low coverage, contamination). Sorted by outlier count desc. The QC counts \
+                span the whole cohort regardless of `--samples`; an `in_samples` column flags \
+                whether each sample is in the `--samples` list so the table can be filtered to \
+                the cases of interest."
     )]
     summary: Option<PathBuf>,
 
@@ -410,9 +427,13 @@ fn main() {
     let has_repeat = repeat_map.is_some();
 
     if has_repeat {
-        println!("chrom\tstart\tend\tname\tsample\tallele_length\ttop_axis\tdeviation\tzygosity");
+        println!(
+            "chrom\tstart\tend\tname\tsample\tallele_length\ttop_axis\tdeviation\tzygosity\tlocus_count"
+        );
     } else {
-        println!("chrom\tstart\tend\tsample\tallele_length\ttop_axis\tdeviation\tzygosity");
+        println!(
+            "chrom\tstart\tend\tsample\tallele_length\ttop_axis\tdeviation\tzygosity\tlocus_count"
+        );
     }
 
     // Each locus is fully independent: feature computation, DBSCAN, and plot-data generation are
@@ -744,11 +765,21 @@ fn main() {
             }
 
             if !result.outlier_calls.is_empty() {
+                // How many distinct samples are outliers at this locus, across any
+                // axis — a recurrence signal that lets you tell a one-off from a
+                // locus where many samples look unusual. All of this locus's calls
+                // are already in hand, so this needs no second pass over the output.
+                let locus_count = result
+                    .outlier_calls
+                    .iter()
+                    .map(|c| &c.sample)
+                    .collect::<HashSet<_>>()
+                    .len();
                 for call in &result.outlier_calls {
                     if has_repeat {
                         let name = result.label.as_deref().unwrap_or(".");
                         println!(
-                            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}",
+                            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}",
                             result.chrom,
                             result.pos,
                             result.end,
@@ -758,10 +789,11 @@ fn main() {
                             call.top_axis,
                             call.deviation,
                             call.zygosity,
+                            locus_count,
                         );
                     } else {
                         println!(
-                            "{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}",
+                            "{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}",
                             result.chrom,
                             result.pos,
                             result.end,
@@ -770,6 +802,7 @@ fn main() {
                             call.top_axis,
                             call.deviation,
                             call.zygosity,
+                            locus_count,
                         );
                     }
                 }
@@ -854,8 +887,54 @@ fn main() {
     }
 
     if let Some(ref path) = args.plot {
-        plot::render_scatter_plots(&plot_loci, path);
+        plot::render_scatter_plots(&plot_loci, path, args.jitter, args.interactive);
     }
+}
+
+/// Median of `values` (does not mutate the input).
+fn median(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut v = values.to_vec();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = v.len();
+    if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        (v[n / 2 - 1] + v[n / 2]) / 2.0
+    }
+}
+
+/// Iglewicz–Hoaglin modified z-scores: `(x − median) / (1.4826 × MAD)`, where MAD
+/// is the median absolute deviation from the median. We use the *median*-based
+/// scale rather than mean/standard deviation on purpose: the samples we want to
+/// flag (many outlier loci) would otherwise inflate the mean and SD and mask
+/// themselves. When the MAD is zero — e.g. more than half the cohort shares one
+/// rate (often 0) — it falls back to the mean absolute deviation
+/// (`1.253314 × meanAD`), and to all-zero when every value is identical.
+fn modified_zscores(values: &[f64]) -> Vec<f64> {
+    let n = values.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let med = median(values);
+    let abs_dev: Vec<f64> = values.iter().map(|v| (v - med).abs()).collect();
+    let mad = median(&abs_dev);
+    let scale = if mad > 0.0 {
+        1.4826 * mad
+    } else {
+        let mean_ad = abs_dev.iter().sum::<f64>() / n as f64;
+        if mean_ad > 0.0 {
+            1.253314 * mean_ad
+        } else {
+            0.0
+        }
+    };
+    values
+        .iter()
+        .map(|v| if scale > 0.0 { (v - med) / scale } else { 0.0 })
+        .collect()
 }
 
 fn write_summary(
@@ -865,10 +944,14 @@ fn write_summary(
 ) {
     let f = std::fs::File::create(path).expect("Cannot create summary file");
     let mut w = BufWriter::new(f);
-    writeln!(w, "sample\tin_samples\tn_loci\tn_outlier\toutlier_rate").unwrap();
+    writeln!(
+        w,
+        "sample\tin_samples\tn_loci\tn_outlier\toutlier_rate\tmod_zscore"
+    )
+    .unwrap();
     // in_samples flags whether the sample is in the --samples list (true for everyone when no
     // list was given), so the cohort-wide QC table can be filtered down to the cases of interest.
-    let mut rows: Vec<(&String, bool, usize, usize, f64)> = stats
+    let rows: Vec<(&String, bool, usize, usize, f64)> = stats
         .iter()
         .map(|(s, (l, o))| {
             let rate = if *l > 0 { *o as f64 / *l as f64 } else { 0.0 };
@@ -879,18 +962,34 @@ fn write_summary(
             (s, in_samples, *l, *o, rate)
         })
         .collect();
+
+    // mod_zscore tells you how unusual a sample's outlier_rate is relative to the
+    // whole cohort, so "is this n_outlier a lot?" has a calibrated answer: by the
+    // common Iglewicz–Hoaglin convention, |mod_zscore| > 3.5 marks a sample whose
+    // outlier rate is anomalously high (usually a QC issue) rather than normal
+    // variation. Computed over every sample in the table (the cohort), regardless
+    // of --samples. NB it scores the *rate*, so a sample seen at very few loci can
+    // still score high on a single flag — read it alongside n_loci.
+    let rates: Vec<f64> = rows.iter().map(|r| r.4).collect();
+    let zscores = modified_zscores(&rates);
+
     // Sort by outlier count desc (the QC signal), then rate desc as tiebreaker so a sample
-    // flagged 5/10 ranks above one flagged 5/100.
+    // flagged 5/10 ranks above one flagged 5/100. Carry each row's z-score along with it.
+    let mut rows: Vec<(&String, bool, usize, usize, f64, f64)> = rows
+        .into_iter()
+        .zip(zscores)
+        .map(|((s, i, l, o, r), z)| (s, i, l, o, r, z))
+        .collect();
     rows.sort_by(|a, b| {
         b.3.cmp(&a.3)
             .then(b.4.partial_cmp(&a.4).unwrap_or(std::cmp::Ordering::Equal))
             .then(a.0.cmp(b.0))
     });
-    for (sample, in_samples, n_loci, n_outlier, rate) in rows {
+    for (sample, in_samples, n_loci, n_outlier, rate, mod_z) in rows {
         writeln!(
             w,
-            "{}\t{}\t{}\t{}\t{:.4}",
-            sample, in_samples, n_loci, n_outlier, rate
+            "{}\t{}\t{}\t{}\t{:.4}\t{:.2}",
+            sample, in_samples, n_loci, n_outlier, rate, mod_z
         )
         .unwrap();
     }
@@ -1323,3 +1422,41 @@ fn raise_fd_limit() {
 
 #[cfg(not(unix))]
 fn raise_fd_limit() {}
+
+#[cfg(test)]
+mod tests {
+    use super::{median, modified_zscores};
+
+    #[test]
+    fn median_odd_even_empty() {
+        assert_eq!(median(&[3.0, 1.0, 2.0]), 2.0);
+        assert_eq!(median(&[1.0, 2.0, 3.0, 4.0]), 2.5);
+        assert_eq!(median(&[]), 0.0);
+    }
+
+    #[test]
+    fn modified_z_flags_high_rate_sample() {
+        // Mostly-low rates with one clearly anomalous sample (last).
+        let rates = [0.0, 0.01, 0.02, 0.0, 0.03, 0.02, 0.30];
+        let z = modified_zscores(&rates);
+        let last = *z.last().unwrap();
+        assert!(last > 3.5, "anomalous sample should clear 3.5, got {last}");
+        assert!(z[..z.len() - 1].iter().all(|v| *v < last));
+    }
+
+    #[test]
+    fn modified_z_zero_mad_falls_back_to_mean_abs_dev() {
+        // >half identical → MAD == 0; must not divide by zero and still flags the
+        // lone different value.
+        let z = modified_zscores(&[0.0, 0.0, 0.0, 0.0, 0.5]);
+        assert!(z[4] > 0.0 && z[4].is_finite());
+        assert!(z[..4].iter().all(|v| *v <= 0.0));
+    }
+
+    #[test]
+    fn modified_z_all_identical_is_zero() {
+        assert!(modified_zscores(&[0.1, 0.1, 0.1])
+            .iter()
+            .all(|v| *v == 0.0));
+    }
+}

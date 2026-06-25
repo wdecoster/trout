@@ -30,6 +30,7 @@ The main output is tab-separated to stdout, with **one row per outlier sample pe
 | `top_axis` | Feature axis with the largest deviation from the cluster mean for that allele (e.g. `length` for an expansion, or a k-mer name like `CGG` for a composition outlier) |
 | `deviation` | Magnitude of that deviation in the normalized [0,1] feature space (length deviation is rescaled by `--length-weight` for fair comparison with k-mer deviations) |
 | `zygosity` | Genotype zygosity at the locus: `hom` (alleles identical), `het` (alleles differ, including compound-het expansions), or `hemi` (a single allele was called, e.g. haploid chrX/Y) |
+| `locus_count` | How many distinct samples are outliers at this locus, across any axis (the value is the same on every row of a locus). Lets you tell a one-off from a locus where many samples look unusual — a high `locus_count` often points to a difficult-to-genotype locus rather than per-sample biology. Sort/group by it to rank loci by recurrence. |
 
 Rows are grouped by locus and within a locus sorted by `deviation` descending, so the most extreme calls appear first. A sample with both alleles flagged is reported as a single row — `zygosity` carries the biallelic signal (`hom` for a homozygous expansion, `het` for a compound het, where `allele_length`/`deviation` describe the more-deviant allele). Loci are emitted in genome/contig order (the `##contig` order of the input VCFs). Only loci with at least one outlier are printed.
 
@@ -70,18 +71,24 @@ When k varies across loci (i.e. `-k auto`, or `--repeat` rows specifying differe
 
 ### `--plot FILE`
 
-Writes an interactive SVG file with one scatter plot per outlier axis per locus. Each plot shows:
+Writes an SVG file with one scatter plot per outlier axis per locus. Each plot shows:
 - **X axis**: allele length in bp
 - **Y axis**: the top composition axis (or the best composition axis for length outliers)
-- **Blue points**: normal alleles
+- **Blue points**: normal alleles — shaded from light (one sample) to dark navy (many), see below
 - **Red points**: outlier alleles for this axis
 - **Orange points**: outlier alleles attributed to a different axis (context)
 
-Outlier sample names are annotated with arrows. Hover over any point in a browser to see the sample name. A shared legend panel is appended at the end of the grid.
+Outlier sample names are annotated with arrows and are hoverable. A shared legend panel is appended at the end of the grid.
+
+By default the plot is built to **stay openable for large cohorts**: the normal cloud is the overwhelming majority of points and most of them overlap, so it is collapsed to one marker per position, each **shaded by how many samples it holds** (so a position with 300 samples reads as dark navy, not a lone point). Only outliers carry an individual hover label. This cuts the SVG to roughly a tenth the size and ~13× fewer DOM elements than drawing every sample as its own interactive marker — the difference between a file a browser can scroll and one it can't. For full per-point interactivity, see [`--interactive`](#--interactive).
+
+### `--interactive`
+
+Make the `--plot` SVG fully interactive: **hover any point** (normal or outlier) for its sample name, plus a **search box** to filter. This restores per-point detail at the cost of a much larger, heavier file — one DOM node per sample per locus — so it is only practical for **small cohorts or few loci**. Without it (the default) the normal cloud is collapsed and density-shaded as described under `--plot`. Off by default.
 
 ### `--jitter`
 
-Add a small deterministic jitter to scatter-plot points so samples sharing the same length and composition — which otherwise stack into a single marker — fan out into a visible cloud. Purely cosmetic: it does not affect outlier calling. Off by default.
+Add a small deterministic jitter to scatter-plot points so samples sharing the same length and composition — which otherwise stack into a single marker — fan out into a visible cloud. Purely cosmetic: it does not affect outlier calling. Because it relies on every point being drawn individually, it **turns off the default density-collapse** (like `--interactive`), so expect a larger file. Off by default.
 
 ### `--min-axis-dev THRESH`
 
@@ -109,7 +116,11 @@ Drop alleles whose STRdust `SUP` (read support) field is below `N` before any cl
 
 ### `--summary FILE`
 
-Write a per-sample QC TSV to FILE with columns `sample`, `n_loci` (loci where the sample contributed at least one allele), `n_outlier` (loci where the sample was a DBSCAN noise point), and `outlier_rate` (n_outlier / n_loci). Sorted by outlier count desc. Samples flagged at many loci are usually QC issues (low coverage, contamination, swap) rather than biologically interesting — useful as a first pass before investigating individual loci. The QC counts ignore `--samples`, so controls are included alongside the samples-of-interest.
+Write a per-sample QC TSV to FILE with columns `sample`, `in_samples`, `n_loci` (loci where the sample contributed at least one allele), `n_outlier` (loci where the sample was a DBSCAN noise point), `outlier_rate` (n_outlier / n_loci), and `mod_zscore`. Sorted by outlier count desc. Samples flagged at many loci are usually QC issues (low coverage, contamination, swap) rather than biologically interesting — useful as a first pass before investigating individual loci. The QC counts ignore `--samples`, so controls are included alongside the samples-of-interest.
+
+**`mod_zscore`** answers "is this `n_outlier` a lot, or normal?". It is a *robust* z-score of `outlier_rate` across the whole cohort — `(rate − median) / (1.4826 × MAD)`, the Iglewicz–Hoaglin modified z-score, where MAD is the median absolute deviation. The median/MAD scale is used deliberately instead of mean/standard deviation: the high-rate samples we want to flag would otherwise inflate the mean and SD and mask themselves. By the usual convention, **`mod_zscore` > 3.5 marks a sample whose outlier rate is anomalously high** — almost always a technical problem rather than biology. (If more than half the cohort shares one rate so the MAD is zero, the scale falls back to the mean absolute deviation.)
+
+Because `mod_zscore` scores the *rate*, a sample seen at only a handful of loci can still score high off a single flagged locus — read it together with `n_loci`. Samples flagged across many loci with a high `mod_zscore` are the strongest QC candidates.
 
 ### `--samples SAMPLES`
 
