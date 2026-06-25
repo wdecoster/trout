@@ -10,26 +10,53 @@ pub const AUTO_K_MAX: usize = 6;
 /// (impure short REF, or catalog motifs longer than AUTO_K_MAX) trinucleotide composition has
 /// 24 canonical features vs 10 for k=2 — strictly more compositional signal to fall back on.
 pub const AUTO_K_DEFAULT: usize = 3;
-/// Match-rate threshold for `detect_period`. A pure tandem repeat scores 1.0; the threshold
-/// allows roughly 35% mismatches, which is needed to recover GC-rich hexamer repeats whose
-/// raw self-shift rate is suppressed by composition bias (e.g. C9orf72 GGCCCC scores ~0.75 at
-/// p=6 in REF). 0.65 sits comfortably above the p=2 composition floor in the observed loci.
-const PERIOD_MATCH_THRESHOLD: f64 = 0.65;
+/// Composition-corrected self-shift threshold for `detect_period`. The raw self-shift rate is
+/// inflated by base-composition bias: an A-rich motif matches itself at many positions just
+/// because most bases are A, which let short periods clear a raw threshold spuriously (RFC1's
+/// AAAAG is ~80% A, so p=2/3 pass on chance alone). We instead score the rate *above chance*,
+/// `(observed - chance) / (1 - chance)`, so composition cancels out: a pure tandem repeat still
+/// scores ~1.0, GC-rich hexamers (C9orf72 GGCCCC) still clear it, and A-rich motifs no longer
+/// match at short periods. 0.30 keeps recovering impure/biased repeats while rejecting
+/// chance-level periods.
+const PERIOD_SCORE_THRESHOLD: f64 = 0.30;
 
-/// Detect the dominant tandem-repeat period in `seq` by counting positions where seq[i] == seq[i+p].
-/// Returns the smallest p in `AUTO_K_MIN..=k_max` whose match rate clears `PERIOD_MATCH_THRESHOLD`
-/// — that's the fundamental period, since integer multiples of the true period also score highly.
-/// Returns None if the sequence is too short or no period in range is a clean repeat.
+/// Probability that two independently drawn bases of `seq` are identical (`Σ frequencyₐ²`) — the
+/// self-match rate expected by chance given the sequence's base composition.
+fn chance_match_rate(seq: &[u8]) -> f64 {
+    let mut counts = [0usize; 256];
+    for &b in seq {
+        counts[b as usize] += 1;
+    }
+    let n = seq.len() as f64;
+    if n == 0.0 {
+        return 0.0;
+    }
+    counts.iter().map(|&c| (c as f64 / n).powi(2)).sum()
+}
+
+/// Detect the dominant tandem-repeat period in `seq`. For each candidate period it measures the
+/// self-shift match rate (`seq[i] == seq[i+p]`), corrects it for the sequence's base composition,
+/// and returns the smallest p in `AUTO_K_MIN..=k_max` whose corrected score clears
+/// `PERIOD_SCORE_THRESHOLD` — that's the fundamental period, since integer multiples of the true
+/// period also score highly. Returns None if the sequence is too short or no period in range is a
+/// clean repeat.
 pub fn detect_period(seq: &[u8], k_max: usize) -> Option<usize> {
     // Need enough positions to test at the largest period: require at least 2*k_max bases so the
     // smallest comparison set still has k_max samples to average over.
     if seq.len() < 2 * k_max {
         return None;
     }
+    let chance = chance_match_rate(seq);
+    let denom = 1.0 - chance;
+    if denom <= f64::EPSILON {
+        return None; // homopolymer-like: no meaningful period
+    }
     for p in AUTO_K_MIN..=k_max {
         let total = seq.len() - p;
         let matches = (0..total).filter(|&i| seq[i] == seq[i + p]).count();
-        if (matches as f64) / (total as f64) >= PERIOD_MATCH_THRESHOLD {
+        let observed = matches as f64 / total as f64;
+        let score = (observed - chance) / denom;
+        if score >= PERIOD_SCORE_THRESHOLD {
             return Some(p);
         }
     }
@@ -261,10 +288,21 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_period_picks_smallest() {
-        // homopolymer is technically period 1, 2, 3, ... but our floor is AUTO_K_MIN (2)
+    fn test_detect_period_homopolymer_is_none() {
+        // A pure homopolymer has no meaningful repeat period: every shift matches
+        // by composition, not by structure. With the composition correction the
+        // chance match rate is 1.0, so nothing clears the threshold and we return
+        // None (the caller then falls back to the default k).
         let seq = b"AAAAAAAAAAAAAAAA";
-        assert_eq!(detect_period(seq, 6), Some(AUTO_K_MIN));
+        assert_eq!(detect_period(seq, 6), None);
+    }
+
+    #[test]
+    fn test_detect_period_arich_pentamer() {
+        // AAAAG is ~80% A; without composition correction the abundance of A lets
+        // short periods match by chance. Correction must still recover 5.
+        let seq = b"AAAAGAAAAGAAAAGAAAAGAAAAGAAAAG";
+        assert_eq!(detect_period(seq, 6), Some(5));
     }
 
     #[test]
