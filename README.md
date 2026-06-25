@@ -79,6 +79,10 @@ Writes an interactive SVG file with one scatter plot per outlier axis per locus.
 
 Outlier sample names are annotated with arrows. Hover over any point in a browser to see the sample name. A shared legend panel is appended at the end of the grid.
 
+### `--jitter`
+
+Add a small deterministic jitter to scatter-plot points so samples sharing the same length and composition — which otherwise stack into a single marker — fan out into a visible cloud. Purely cosmetic: it does not affect outlier calling. Off by default.
+
 ### `--min-axis-dev THRESH`
 
 Suppress outlier calls where the top axis deviation from the cluster mean is below THRESH. Values are in the normalized [0,1] feature space: 0.05 corresponds to a 5 percentage point difference in a k-mer frequency or 5% of the maximum allele length. Useful range: 0.05–0.15. Off by default.
@@ -90,6 +94,14 @@ This threshold is applied at two levels:
 ### `--min-length N`
 
 Only report outliers where the flagged allele is at least N bp long. Useful to suppress noise from short alleles whose length variation is biological rather than pathological. Off by default.
+
+### `--min-fold-length FOLD`
+
+Only report length outliers whose flagged allele differs from the longest-allele cluster's mean length by at least FOLD-fold in either direction — e.g. `1.5` keeps alleles ≥1.5× longer (or ≤0.67× shorter) than that reference. On multi-modal loci the reference is the cluster with the longest alleles, not a pooled mean between modes. Suppresses length outliers with only a modest size change; composition (k-mer) outliers are unaffected. Combine with `--expansions-only` to keep large expansions only. Off by default.
+
+### `--expansions-only`
+
+Only report length outliers that are *longer* than the longest-allele cluster (expansions). A length outlier that is shorter than that reference cluster (a contraction) is suppressed. On multi-modal loci the reference is the cluster with the longest alleles. Composition (k-mer) outliers and length expansions are unaffected. Off by default.
 
 ### `--min-support N`
 
