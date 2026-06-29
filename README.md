@@ -24,6 +24,18 @@ cargo install --path .
 # or: cargo build --release  → target/release/trout
 ```
 
+## Development
+
+After cloning, install the git hooks once. They run `cargo fmt`, `clippy`, and
+the tests on commit/push, which catches the formatting and lint issues that are
+the most common cause of CI failures.
+
+```bash
+make install-hooks
+```
+
+Run `make help` for the other available targets (`fmt`, `clippy`, `test`, `ci`, …).
+
 ## Usage
 
 ```bash
