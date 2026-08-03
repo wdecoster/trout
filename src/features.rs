@@ -115,7 +115,7 @@ pub struct KmerTable {
 
 impl KmerTable {
     pub fn new(k: usize) -> Self {
-        const BASES: [u8; 4] = [b'A', b'C', b'G', b'T'];
+        const BASES: [u8; 4] = *b"ACGT";
         let num_raw = 4usize.pow(k as u32);
 
         // Decode raw index → base array
