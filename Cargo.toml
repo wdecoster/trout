@@ -11,7 +11,7 @@ repository = "https://github.com/wdecoster/trout"
 clap = { version = "4", features = ["derive"] }
 dbscan = "0.3.1"
 flate2 = "1"
-kuva = "0.4"
+kuva = "0.5"
 log = "0.4"
 env_logger = "0.11"
 rayon = "1"
